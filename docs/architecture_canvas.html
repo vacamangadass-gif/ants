@@ -1,0 +1,1267 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TinyBrains Ants - 代码库架构全景与关系画布</title>
+  <style>
+    :root {
+      --bg-primary: #090d16;
+      --bg-secondary: #0f172a;
+      --bg-surface: rgba(30, 41, 59, 0.7);
+      --border-color: rgba(51, 65, 85, 0.6);
+      --text-primary: #f8fafc;
+      --text-secondary: #94a3b8;
+      --text-muted: #64748b;
+      --engine-color: #8b5cf6;
+      --mapgen-color: #10b981;
+      --viz-color: #06b6d4;
+      --baselines-color: #f59e0b;
+      --tools-color: #ef4444;
+      --maps-color: #eab308;
+      --ci-color: #64748b;
+      --accent: #3b82f6;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+      background-color: var(--bg-primary);
+      color: var(--text-primary);
+      overflow: hidden;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* 顶部导航控制栏 */
+    header {
+      height: 60px;
+      background: rgba(15, 23, 42, 0.85);
+      backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--border-color);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 20px;
+      z-index: 20;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .brand-logo {
+      width: 32px;
+      height: 32px;
+      background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 900;
+      font-size: 18px;
+      color: #fff;
+      box-shadow: 0 0 12px rgba(59, 130, 246, 0.4);
+    }
+    .brand-title {
+      font-size: 16px;
+      font-weight: 700;
+      letter-spacing: 0.5px;
+    }
+    .brand-subtitle {
+      font-size: 12px;
+      color: var(--text-muted);
+      margin-left: 6px;
+    }
+
+    .search-box {
+      display: flex;
+      align-items: center;
+      background: rgba(30, 41, 59, 0.8);
+      border: 1px solid var(--border-color);
+      border-radius: 20px;
+      padding: 4px 14px;
+      width: 280px;
+      transition: all 0.2s ease;
+    }
+    .search-box:focus-within {
+      border-color: var(--accent);
+      box-shadow: 0 0 10px rgba(59, 130, 246, 0.3);
+      width: 320px;
+    }
+    .search-input {
+      background: transparent;
+      border: none;
+      outline: none;
+      color: #fff;
+      font-size: 13px;
+      width: 100%;
+      margin-left: 8px;
+    }
+    .search-input::placeholder { color: var(--text-muted); }
+
+    .nav-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .view-toggle {
+      display: flex;
+      background: rgba(30, 41, 59, 0.6);
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      padding: 2px;
+    }
+    .toggle-btn {
+      padding: 6px 14px;
+      border-radius: 6px;
+      font-size: 13px;
+      cursor: pointer;
+      border: none;
+      background: transparent;
+      color: var(--text-secondary);
+      transition: all 0.2s;
+    }
+    .toggle-btn.active {
+      background: var(--accent);
+      color: #fff;
+      font-weight: 600;
+      box-shadow: 0 0 10px rgba(59, 130, 246, 0.4);
+    }
+
+    /* 模块过滤器药丸 */
+    .filter-bar {
+      height: 46px;
+      background: rgba(15, 23, 42, 0.7);
+      backdrop-filter: blur(8px);
+      border-bottom: 1px solid rgba(51, 65, 85, 0.3);
+      display: flex;
+      align-items: center;
+      padding: 0 20px;
+      gap: 8px;
+      overflow-x: auto;
+      z-index: 15;
+    }
+    .filter-pill {
+      padding: 4px 12px;
+      border-radius: 14px;
+      font-size: 12px;
+      font-weight: 500;
+      cursor: pointer;
+      border: 1px solid transparent;
+      background: rgba(30, 41, 59, 0.5);
+      color: var(--text-secondary);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      white-space: nowrap;
+      transition: all 0.2s;
+    }
+    .filter-pill:hover {
+      background: rgba(51, 65, 85, 0.8);
+      color: #fff;
+    }
+    .filter-pill.active {
+      background: rgba(59, 130, 246, 0.2);
+      border-color: var(--accent);
+      color: #fff;
+      font-weight: 600;
+    }
+    .pill-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+    }
+
+    /* 画布主视口 */
+    .viewport {
+      flex: 1;
+      position: relative;
+      overflow: hidden;
+    }
+    #graphCanvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      cursor: grab;
+    }
+    #graphCanvas:active {
+      cursor: grabbing;
+    }
+
+    /* 画布悬浮控制器 */
+    .canvas-hud {
+      position: absolute;
+      bottom: 24px;
+      left: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      z-index: 10;
+    }
+    .hud-btn {
+      width: 36px;
+      height: 36px;
+      border-radius: 8px;
+      background: rgba(15, 23, 42, 0.85);
+      border: 1px solid var(--border-color);
+      color: var(--text-primary);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      font-size: 16px;
+      transition: all 0.2s;
+      backdrop-filter: blur(8px);
+    }
+    .hud-btn:hover {
+      background: var(--accent);
+      border-color: var(--accent);
+    }
+    .canvas-legend {
+      position: absolute;
+      bottom: 24px;
+      right: 24px;
+      background: rgba(15, 23, 42, 0.85);
+      border: 1px solid var(--border-color);
+      border-radius: 10px;
+      padding: 10px 14px;
+      font-size: 11px;
+      color: var(--text-muted);
+      backdrop-filter: blur(8px);
+      z-index: 10;
+      display: flex;
+      gap: 14px;
+    }
+
+    /* 卡片列表视图 */
+    .cards-view {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      overflow-y: auto;
+      padding: 24px;
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+      gap: 20px;
+      background: var(--bg-primary);
+      z-index: 5;
+    }
+    .cards-view.hidden { display: none; }
+
+    .code-card {
+      background: rgba(15, 23, 42, 0.8);
+      border: 1px solid var(--border-color);
+      border-radius: 12px;
+      padding: 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      cursor: pointer;
+      transition: all 0.25s ease;
+      position: relative;
+      overflow: hidden;
+    }
+    .code-card::before {
+      content: '';
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 4px;
+      height: 100%;
+      background: var(--card-color, #3b82f6);
+    }
+    .code-card:hover {
+      transform: translateY(-3px);
+      border-color: var(--card-color, #3b82f6);
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+    }
+    .card-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .card-title {
+      font-size: 15px;
+      font-weight: 700;
+      color: #fff;
+    }
+    .card-tag {
+      font-size: 10px;
+      font-weight: 600;
+      padding: 2px 8px;
+      border-radius: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .card-path {
+      font-family: monospace;
+      font-size: 11px;
+      color: var(--text-muted);
+      word-break: break-all;
+    }
+    .card-desc {
+      font-size: 13px;
+      color: var(--text-secondary);
+      line-height: 1.5;
+    }
+    .card-footer {
+      margin-top: auto;
+      padding-top: 10px;
+      border-top: 1px solid rgba(51, 65, 85, 0.4);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 11px;
+      color: var(--text-muted);
+    }
+
+    /* 侧边抽屉卡片详情 (Drawer) */
+    .drawer {
+      position: absolute;
+      top: 0;
+      right: -480px;
+      width: 460px;
+      height: 100%;
+      background: rgba(15, 23, 42, 0.95);
+      border-left: 1px solid var(--border-color);
+      backdrop-filter: blur(16px);
+      padding: 28px 24px;
+      z-index: 30;
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+      overflow-y: auto;
+      transition: right 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+      box-shadow: -10px 0 30px rgba(0,0,0,0.5);
+    }
+    .drawer.open { right: 0; }
+
+    .drawer-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+    }
+    .drawer-close {
+      background: transparent;
+      border: none;
+      color: var(--text-muted);
+      font-size: 20px;
+      cursor: pointer;
+      padding: 4px;
+    }
+    .drawer-close:hover { color: #fff; }
+
+    .drawer-badge {
+      display: inline-block;
+      font-size: 11px;
+      font-weight: 700;
+      padding: 3px 10px;
+      border-radius: 12px;
+      margin-bottom: 8px;
+    }
+    .drawer-title {
+      font-size: 20px;
+      font-weight: 800;
+      color: #fff;
+    }
+    .drawer-path {
+      font-family: monospace;
+      font-size: 12px;
+      color: var(--text-muted);
+      background: rgba(0, 0, 0, 0.3);
+      padding: 4px 8px;
+      border-radius: 6px;
+      margin-top: 6px;
+      word-break: break-all;
+    }
+
+    .section-block {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .section-label {
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--accent);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .section-content {
+      font-size: 13px;
+      color: var(--text-secondary);
+      line-height: 1.6;
+      background: rgba(30, 41, 59, 0.4);
+      padding: 10px 14px;
+      border-radius: 8px;
+      border: 1px solid rgba(51, 65, 85, 0.3);
+    }
+    .related-chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 4px;
+    }
+    .chip {
+      font-size: 11px;
+      padding: 4px 10px;
+      border-radius: 6px;
+      background: rgba(59, 130, 246, 0.15);
+      border: 1px solid rgba(59, 130, 246, 0.4);
+      color: #93c5fd;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .chip:hover {
+      background: var(--accent);
+      color: #fff;
+    }
+
+    .highlight-rule {
+      border-left: 3px solid #ef4444;
+      background: rgba(239, 68, 68, 0.1);
+      padding: 10px 14px;
+      border-radius: 0 8px 8px 0;
+      font-size: 12px;
+      color: #fca5a5;
+      line-height: 1.5;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- 头部控制栏 -->
+  <header>
+    <div class="brand">
+      <div class="brand-logo">🐜</div>
+      <div>
+        <div class="brand-title">Ants 架构全景画布 <span class="brand-subtitle">TinyBrains 基准卡带</span></div>
+      </div>
+    </div>
+
+    <div class="search-box">
+      <span>🔍</span>
+      <input type="text" id="searchInput" class="search-input" placeholder="按文件名或功能检索 (如 turn, planes, sweep)...">
+    </div>
+
+    <div class="nav-actions">
+      <div class="view-toggle">
+        <button id="btnCanvasView" class="toggle-btn active">🌐 关系画布</button>
+        <button id="btnCardsView" class="toggle-btn">📇 卡片导读墙</button>
+      </div>
+    </div>
+  </header>
+
+  <!-- 模块过滤器 -->
+  <div class="filter-bar" id="filterBar">
+    <div class="filter-pill active" data-filter="all">全部板块 (All)</div>
+    <div class="filter-pill" data-filter="engine"><span class="pill-dot" style="background:var(--engine-color)"></span>核心引擎 (engine)</div>
+    <div class="filter-pill" data-filter="mapgen"><span class="pill-dot" style="background:var(--mapgen-color)"></span>棋盘工厂 (mapgen)</div>
+    <div class="filter-pill" data-filter="viz"><span class="pill-dot" style="background:var(--viz-color)"></span>回放查看器 (viz)</div>
+    <div class="filter-pill" data-filter="baselines"><span class="pill-dot" style="background:var(--baselines-color)"></span>算法训练 (baselines)</div>
+    <div class="filter-pill" data-filter="tools"><span class="pill-dot" style="background:var(--tools-color)"></span>构建工具 (tools)</div>
+    <div class="filter-pill" data-filter="maps"><span class="pill-dot" style="background:var(--maps-color)"></span>基准棋盘 (maps)</div>
+    <div class="filter-pill" data-filter="ci"><span class="pill-dot" style="background:var(--ci-color)"></span>发布流水线 (.github)</div>
+  </div>
+
+  <!-- 主视口 -->
+  <div class="viewport">
+    <canvas id="graphCanvas"></canvas>
+
+    <!-- 画布悬浮控制器 -->
+    <div class="canvas-hud">
+      <button class="hud-btn" id="btnZoomIn" title="放大">➕</button>
+      <button class="hud-btn" id="btnZoomOut" title="缩小">➖</button>
+      <button class="hud-btn" id="btnResetView" title="重置居中">🎯</button>
+    </div>
+
+    <!-- 图例 -->
+    <div class="canvas-legend">
+      <span>🟣 引擎/Wasm</span>
+      <span>🟢 棋盘生成</span>
+      <span>🔵 前端查看器</span>
+      <span>🟠 神经网络管线</span>
+      <span>🔴 门禁工具</span>
+      <span>🟡 棋盘数据</span>
+      <span>⚪ CI/CD</span>
+    </div>
+
+    <!-- 卡片墙视图 -->
+    <div id="cardsContainer" class="cards-view hidden"></div>
+
+    <!-- 侧边抽屉卡片详情 -->
+    <div id="detailDrawer" class="drawer">
+      <div class="drawer-header">
+        <div>
+          <span id="drawerBadge" class="drawer-badge">SUBMODULE</span>
+          <h2 id="drawerTitle" class="drawer-title">File Name</h2>
+          <div id="drawerPath" class="drawer-path">path/to/file</div>
+        </div>
+        <button id="drawerClose" class="drawer-close">✕</button>
+      </div>
+
+      <div class="section-block">
+        <div class="section-label">🎯 核心定位与导读</div>
+        <div id="drawerSummary" class="section-content">一句话总结</div>
+      </div>
+
+      <div class="section-block">
+        <div class="section-label">⚡ 核心职责与功能</div>
+        <div id="drawerDuties" class="section-content">职责列表</div>
+      </div>
+
+      <div class="section-block">
+        <div class="section-label">📥 外部输入与输出</div>
+        <div id="drawerIO" class="section-content">输入输出</div>
+      </div>
+
+      <div class="section-block">
+        <div class="section-label">🔗 上下游关联节点</div>
+        <div id="drawerRelated" class="related-chips"></div>
+      </div>
+
+      <div id="drawerRuleBlock" class="highlight-rule">
+        <strong>⚠️ 关键约束与铁律：</strong>
+        <span id="drawerRule"></span>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // 节点与关系全量数据
+    const modulesData = [
+      // ====== ENGINE (紫色) ======
+      {
+        id: "engine_lib",
+        name: "lib.rs",
+        sub: "engine",
+        color: "#8b5cf6",
+        x: 600, y: 150,
+        path: "engine/src/lib.rs",
+        summary: "插件导出与分发网关。严格不含任何游戏规则，负责对接 Wasm ABI 导出 5 大接口并转发 JSON 数据。",
+        duties: "1. 接收 tb.ants 5 大 ABI 请求\n2. 解析与打包 JSON 结构体\n3. 拦截 panic 保证健壮性\n4. 调用底层模块执行实际逻辑",
+        io: "输入：JSON 字符串 / 导出参数\n输出：导出的 JSON 结果与状态",
+        related: ["engine_turn", "engine_observe", "engine_codec", "engine_replay", "engine_maps"],
+        rule: "严禁在此文件编写任何具体游戏规则！必须严格维持插件分发与业务逻辑解耦。"
+      },
+      {
+        id: "engine_turn",
+        name: "turn.rs",
+        sub: "engine",
+        color: "#8b5cf6",
+        x: 600, y: 300,
+        path: "engine/src/turn.rs",
+        summary: "回合结算心脏。实现不可调换的 6 大固定结算阶段，裁定终局与排名。",
+        duties: "1. 阶段 1 Move：位移与碰撞\n2. 阶段 2 Attack：Focus Battle 聚焦战斗\n3. 阶段 3 Raze：摧毁敌穴\n4. 阶段 4 Spawn：生成新蚂蚁\n5. 阶段 5 Gather：采食入库\n6. 阶段 6 Spawn Food：补充食物",
+        io: "输入：当前 MatchState 与 actions\n输出：结算后的状态、回放差分与胜负结果",
+        related: ["engine_state", "engine_food", "engine_grid", "engine_observe"],
+        rule: "结算顺序是游戏刚性契约，绝对禁止颠倒！Focus Battle 计算必须严格吻合 2011 官方引擎。"
+      },
+      {
+        id: "engine_state",
+        name: "state.rs",
+        sub: "engine",
+        color: "#8b5cf6",
+        x: 440, y: 300,
+        path: "engine/src/state.rs",
+        summary: "单局状态仓库。维护存活蚂蚁、蚁穴轨道、每个座位的 next_id 计数器与步数截止阈值。",
+        duties: "1. 维护蚂蚁列表与其绝对坐标\n2. 保证 ant_id 终身固定且不重复\n3. 记录截止计数器与对局指标",
+        io: "输入：对局初始化配置\n输出：MatchState 运行时结构",
+        related: ["engine_turn", "engine_grid"],
+        rule: "蚂蚁 ID 是每个座位独立编号的，阻挡时绝不丢弃，死亡后绝不二次分配给新蚂蚁。"
+      },
+      {
+        id: "engine_observe",
+        name: "observe.rs",
+        sub: "engine",
+        color: "#8b5cf6",
+        x: 780, y: 300,
+        path: "engine/src/observe.rs",
+        summary: "选手视野发生器。计算战争迷雾、已知水域，并将视野投射为观察者相对视角（Observer-Relative）。",
+        duties: "1. 计算视野半径内的可见迷雾\n2. 累积更新 known_water 已知水域\n3. 阵营重标记（自己永远是 0 号，敌方相对排序）\n4. 生成与 mine 蚂蚁严格对齐的 ids 列表",
+        io: "输入：当前世界绝对状态\n输出：每个座位的受限视野字典 (View)",
+        related: ["engine_turn", "engine_grid", "baselines_planes"],
+        rule: "视野字典中严禁携带 memory 或 ant_memory 键，记忆由宿主运行器独立挂载！"
+      },
+      {
+        id: "engine_grid",
+        name: "grid.rs",
+        sub: "engine",
+        color: "#8b5cf6",
+        x: 600, y: 440,
+        path: "engine/src/grid.rs",
+        summary: "环面几何与随机数基石。纯整数计算环面网格环绕折叠、曼哈顿/欧氏距离判定与位图运算。",
+        duties: "1. Wrapping 坐标循环折叠\n2. 视野/攻击/生成半径平方判定\n3. 紧凑位图 Bits\n4. 确定性随机数 Rng",
+        io: "输入：坐标、方向与半径\n输出：折叠坐标、距离判定布尔值",
+        related: ["engine_turn", "engine_maps", "engine_food"],
+        rule: "全文件绝对禁止浮点数！必须通过整数平方来比对几何半径。"
+      },
+      {
+        id: "engine_maps",
+        name: "maps.rs",
+        sub: "engine",
+        color: "#8b5cf6",
+        x: 440, y: 150,
+        path: "engine/src/maps.rs",
+        summary: "棋盘解析器与合法性守门员。验证棋盘平移对称性向量、蚁穴轨道完整性与可行走陆地单连通性。",
+        duties: "1. 反序列化棋盘 JSON 数据\n2. Floodfill 泛洪验证陆地连通性\n3. 验证蚁穴轨道对称性\n4. 确保蚁穴出口未被水系死锁",
+        io: "输入：棋盘 JSON\n输出：合法验证后的 Board 结构体",
+        related: ["maps_files", "engine_lib"],
+        rule: "任何不合规的棋盘在传入 worldgen 时会被直接拒绝对战，确保比赛在合规场地进行。"
+      },
+      {
+        id: "engine_food",
+        name: "food.rs",
+        sub: "engine",
+        color: "#8b5cf6",
+        x: 440, y: 440,
+        path: "engine/src/food.rs",
+        summary: "隐式食物补给算法。负责计算补给速率、对称点集生成与待投递队列随机打乱。",
+        duties: "1. 依据公式计算隐式食物速率\n2. 在全对称轨道上成组布置食物\n3. 缓冲排队并在每回合安全投放",
+        io: "输入：对局种子与当前棋盘\n输出：新生成的食物坐标集",
+        related: ["engine_turn", "engine_grid"],
+        rule: "食物生成必须在全对称轨道上整体投放，确保任意时刻没有任何一个座位具备资源优势。"
+      },
+      {
+        id: "engine_codec",
+        name: "codec.rs",
+        sub: "engine",
+        color: "#8b5cf6",
+        x: 780, y: 150,
+        path: "engine/src/codec.rs",
+        summary: "状态打包密封仓。将包含数局并发的 wave_state 压缩为二进制密文并进行 Base64 编解码。",
+        duties: "1. 紧凑二进制序列化\n2. Base64 编码与解码\n3. 保持对外完全不透明",
+        io: "输入：内存 WaveState\n输出：Base64 字符串",
+        related: ["engine_lib"],
+        rule: "对所有外部系统完全不透明，不暴露内部字段，不设版本号。"
+      },
+      {
+        id: "engine_replay",
+        name: "replay.rs",
+        sub: "engine",
+        color: "#8b5cf6",
+        x: 780, y: 440,
+        path: "engine/src/replay.rs",
+        summary: "对局录像流重模拟器。负责将动作流快速解算为可视化差分帧数据。",
+        duties: "1. 记录对局输入动作流\n2. 响应 replay-decode 请求\n3. 快速重放生成每帧画面变化",
+        io: "输入：Replay Envelope 与帧范围\n输出：动画渲染帧列表",
+        related: ["engine_lib", "viz_engine"],
+        rule: "重放本身只存储种子、棋盘和动作流，所有具体画面均为再次模拟生成。"
+      },
+
+      // ====== MAPGEN (绿色) ======
+      {
+        id: "mapgen_main",
+        name: "main.rs",
+        sub: "mapgen",
+        color: "#10b981",
+        x: 200, y: 150,
+        path: "mapgen/src/main.rs",
+        summary: "棋盘工厂 CLI 总入口。提供 generate、check、show、explore、playtest、adopt、sweep 等命令。",
+        duties: "1. 命令行参数分发\n2. 调用 design 渲染配方\n3. 执行 check 比对字节一致性",
+        io: "输入：CLI 参数与配方文件\n输出：生成的棋盘 JSON 或测试报告",
+        related: ["mapgen_design", "mapgen_sweep", "mapgen_recipes"],
+        rule: "所有棋盘必须由本程序生成，绝不允许直接手动改写 maps/*.json。"
+      },
+      {
+        id: "mapgen_design",
+        name: "design.rs",
+        sub: "mapgen",
+        color: "#10b981",
+        x: 200, y: 300,
+        path: "mapgen/src/design.rs",
+        summary: "棋盘核心工艺渲染器。将 TOML 配方翻译为具体网格，应用群变换雕刻地形与蚁穴。",
+        duties: "1. 读取 TOML 配方参数\n2. 执行全群几何变换映射\n3. 雕刻陆地、洞穴与水域\n4. 安放蚁穴并配置启动食物",
+        io: "输入：Recipe TOML\n输出：棋盘 Board 数据",
+        related: ["mapgen_sym", "mapgen_recipes", "maps_files"],
+        rule: "它是棋盘生成的权威契约，任何对渲染器的修改都会导致所有棋盘重绘。"
+      },
+      {
+        id: "mapgen_sym",
+        name: "sym.rs",
+        sub: "mapgen",
+        color: "#10b981",
+        x: 60, y: 300,
+        path: "mapgen/src/sym.rs",
+        summary: "群论与对称几何求解器。计算环面上各座位的平移向量 shift 及绕中心的点群变换。",
+        duties: "1. 求解环面平移对称向量\n2. 划分非重叠对称轨道 Orbits\n3. 确保所有座位在几何上完全等价",
+        io: "输入：尺寸与座位数\n输出：对称性映射轨道",
+        related: ["mapgen_design", "mapgen_sweep"],
+        rule: "严格保障座位旋转与平移的不变性，是全图绝对公平的前提。"
+      },
+      {
+        id: "mapgen_sweep",
+        name: "sweep.rs",
+        sub: "mapgen",
+        color: "#10b981",
+        x: 200, y: 440,
+        path: "mapgen/src/sweep.rs",
+        summary: "终极对称公平性证明机。让 8 座位运行镜像策略，验证整场比赛完全同构不分歧。",
+        duties: "1. 在多风格棋盘上运行对弈\n2. 将所有座位视野映射到 0 号参考系\n3. 验证每回合所有座位视角与得分 100% 同构",
+        io: "输入：候选棋盘与对战步数\n输出：公平性证明结果或不对称报错",
+        related: ["mapgen_design", "mapgen_sym"],
+        rule: "它是公平性证明而非性能测试！一旦出现分歧立即定位破坏对称性的回合。"
+      },
+      {
+        id: "mapgen_recipes",
+        name: "recipes/*.toml",
+        sub: "mapgen",
+        color: "#10b981",
+        x: 60, y: 150,
+        path: "mapgen/recipes/*.toml",
+        summary: "5 张基础棋盘的设计 DNA。记录高宽、对称参数、洞穴房间参数及种子。",
+        duties: "1. 声明基础棋盘规格\n2. 存储选型固化的随机种子",
+        io: "输入：人工设计配置\n输出：输入给 design.rs 渲染",
+        related: ["mapgen_design", "maps_files"],
+        rule: "配方由 explore 提议、playtest 试玩后通过 adopt 固化写入，不可随意改写。"
+      },
+
+      // ====== VIZ (蓝色) ======
+      {
+        id: "viz_index",
+        name: "index.js",
+        sub: "viz",
+        color: "#06b6d4",
+        x: 1040, y: 150,
+        path: "viz/src/index.js",
+        summary: "回放查看器对外挂载总入口。对外暴露统一的 mount(domElement, options) 方法。",
+        duties: "1. 挂载 UI 外壳 Shell\n2. 初始化渲染画布\n3. 绑定回放数据与控制流",
+        io: "输入：容器 DOM 与 Replay 数据\n输出：查看器实例",
+        related: ["viz_shell", "viz_render", "viz_engine"],
+        rule: "对外导出的核心 API，供 Web 应用、教程手册及 CLI 统一集成使用。"
+      },
+      {
+        id: "viz_render",
+        name: "render.js",
+        sub: "viz",
+        color: "#06b6d4",
+        x: 1040, y: 300,
+        path: "viz/src/render.js",
+        summary: "HTML5 Canvas 核心动画渲染器。以 60 FPS 渲染网格、蚂蚁位移补间、战斗特效与迷雾。",
+        duties: "1. 绘制环面地表与蚁穴\n2. 蚂蚁移动平滑补间动画\n3. 激光聚焦战斗特效\n4. 迷雾半透明遮罩与领地覆层",
+        io: "输入：解码后的当前帧差分\n输出：Canvas 画面渲染",
+        related: ["viz_index", "viz_shell"],
+        rule: "高性能无依赖渲染，保证在极大型棋盘（如 120x124）下依然流畅。"
+      },
+      {
+        id: "viz_engine",
+        name: "engine.js",
+        sub: "viz",
+        color: "#06b6d4",
+        x: 1040, y: 440,
+        path: "viz/src/engine.js",
+        summary: "浏览器端 Wasm 组件客户端桥接。封装调用 jco 转译的 tb_ants.wasm 解密动作流。",
+        duties: "1. 加载转译后的 Wasm 运行时\n2. 调用 tb.ants.replay-decode\n3. 按需提供逐帧与批量解密",
+        io: "输入：Replay 原始数据流\n输出：渲染帧对象",
+        related: ["engine_replay", "viz_render"],
+        rule: "践行单一引擎原则！绝不在 JS 端用脚本重新实现任何游戏规则。"
+      },
+      {
+        id: "viz_check",
+        name: "check.mjs",
+        sub: "viz",
+        color: "#06b6d4",
+        x: 1180, y: 150,
+        path: "viz/check.mjs",
+        summary: "查看器门禁审查脚本。强制要求 CSS 样式必须带 .tb-viz 前缀，验证终局固件一致性。",
+        duties: "1. 静态扫描并拦截无前缀 CSS\n2. 验证最后一帧固件哈希与当前引擎完全匹配",
+        io: "输入：dist/viz 产物\n输出：校验通过或中断构建",
+        related: ["viz_index"],
+        rule: "CSS 污染宿主页面或固件摘要过期都会导致构建直接被掐断。"
+      },
+
+      // ====== BASELINES (橙色) ======
+      {
+        id: "baselines_planes",
+        name: "planes.py",
+        sub: "baselines",
+        color: "#f59e0b",
+        x: 600, y: 600,
+        path: "baselines/src/tb_baselines/planes.py",
+        summary: "空间特征平面编码器。将引擎视野字典转为 PyTorch 2D 张量平面（己方/敌方/食物/水域）。",
+        duties: "1. 解析 observe 输出的视野\n2. 编码 6+ 维通道张量\n3. 处理环面周期性边界特征",
+        io: "输入：Engine Observation 字典\n输出：NumPy/Tensor 特征平面",
+        related: ["engine_observe", "baselines_nets", "baselines_adapters"],
+        rule: "若引擎视野字段变更，必须在此处同步更新特征平面编码，否则神经网络无法解析。"
+      },
+      {
+        id: "baselines_teacher",
+        name: "teacher.py",
+        sub: "baselines",
+        color: "#f59e0b",
+        x: 440, y: 600,
+        path: "baselines/src/tb_baselines/teacher.py",
+        summary: "启发式贪心专家机器人。基于 BFS 寻路探索地图、抢夺食物与围剿敌巢。",
+        duties: "1. 广度优先探索未知迷雾\n2. 贪心指派最近食物采集路线\n3. 为行为克隆 (BC) 提供专家训练轨迹",
+        io: "输入：当前回合视野\n输出：启发式动作列表",
+        related: ["baselines_bc"],
+        rule: "作为基准对照组和模仿学习的教师信号，保证初始模型具备基础存活能力。"
+      },
+      {
+        id: "baselines_bc",
+        name: "train/bc.py",
+        sub: "baselines",
+        color: "#f59e0b",
+        x: 440, y: 740,
+        path: "baselines/src/tb_baselines/train/bc.py",
+        summary: "行为克隆 (Behavioral Cloning) 训练器。通过监督学习模仿专家行为快速冷启动策略。",
+        duties: "1. 采集 Teacher 轨迹数据\n2. 计算动作交叉熵损失\n3. 反向传播更新策略网络权重",
+        io: "输入：专家对战轨迹\n输出：训练好的模型权重 checkpoint",
+        related: ["baselines_teacher", "baselines_export"],
+        rule: "用于参赛选手快速建立基线模型，避免强化学习早期探索效率低下的问题。"
+      },
+      {
+        id: "baselines_export",
+        name: "export.py",
+        sub: "baselines",
+        color: "#f59e0b",
+        x: 780, y: 600,
+        path: "baselines/src/tb_baselines/export.py",
+        summary: "模型导出与 ONNX 转换固化工具。将 PyTorch 模型固化为平台认可的轻量 ONNX 格式。",
+        duties: "1. 模型动转静追踪 (torch.onnx.export)\n2. 验证 ONNX 输入输出张量规格\n3. 确保符合 nano/micro 资源配额",
+        io: "输入：PyTorch 模型\n输出：model.onnx 参赛模型文件",
+        related: ["baselines_planes", "baselines_adapters"],
+        rule: "导出的 ONNX 必须能够通过 test_adapter_conformance.py 的严苛校验。"
+      },
+
+      // ====== TOOLS (红色) ======
+      {
+        id: "tools_deny",
+        name: "deny.sh",
+        sub: "tools",
+        color: "#ef4444",
+        x: 350, y: 50,
+        path: "tools/deny.sh",
+        summary: "浮点数一票否决机。正则扫描 engine/src/ 源码，若发现任何浮点数立即熔断构建。",
+        duties: "1. 扫描 f32, f64, sqrt, pow 关键字\n2. 拦截带小数点的字面量\n3. 保证二进制跨架构绝对确定性",
+        io: "输入：engine/src 源码目录\n输出：0（通过）或 非0（拦截退出）",
+        related: ["engine_grid", "ci_build"],
+        rule: "整个代码库最不可违背的刚性质量守卫之一！"
+      },
+      {
+        id: "tools_package",
+        name: "package.py",
+        sub: "tools",
+        color: "#ef4444",
+        x: 500, y: 50,
+        path: "tools/package.py",
+        summary: "构建收尾打包器。整合 manifest 清单、棋盘目录与 limits.boards 写入 dist/。",
+        duties: "1. 计算 5 张基础棋盘的包络限制\n2. 组装最终的 cartridge.json\n3. 拷贝 maps 目录到 dist/maps/",
+        io: "输入：生成的构件与 maps\n输出：完备可发布的 dist 目录",
+        related: ["maps_files", "ci_build"],
+        rule: "若 maps 目录为空则直接抛出异常拒绝打包。"
+      },
+      {
+        id: "tools_equiv",
+        name: "equivalence.py",
+        sub: "tools",
+        color: "#ef4444",
+        x: 200, y: 600,
+        path: "tools/equivalence.py",
+        summary: "跨版本等价性验证工具。在旧发布与新构建间运行带种子的对战，逐回合比对差异。",
+        duties: "1. 驱动两个不同版本的 Wasm 组件\n2. 执行随机策略和贪心策略对局\n3. 逐回合逐位校验视野、分数与终局",
+        io: "输入：旧发布解压路径与 dist/\n输出：等价性检验结果",
+        related: ["engine_turn", "ci_build"],
+        rule: "重构引擎代码后，证明未改变任何既有规则的绝对证据。"
+      },
+
+      // ====== MAPS (黄色) ======
+      {
+        id: "maps_files",
+        name: "maps/*.json",
+        sub: "maps",
+        color: "#eab308",
+        x: 60, y: 440,
+        path: "maps/*.json",
+        summary: "5 张基础棋盘集合。定义平台全尺寸物理规格包络 (2-8 座位，24-124 尺寸)。",
+        duties: "1. 基础对战场地\n2. 规定平台允许的最大与最小包络\n3. 参考观测绘制的数据底板",
+        io: "输入：由 mapgen recipes 生成\n输出：发布至 dist/maps/",
+        related: ["mapgen_design", "engine_maps", "tools_package"],
+        rule: "禁止手动编辑！所有棋盘必须由配方生成并通过 cargo run -- check 逐字节校验。"
+      },
+
+      // ====== CI (灰色) ======
+      {
+        id: "ci_build",
+        name: "build.yml",
+        sub: "ci",
+        color: "#64748b",
+        x: 600, y: 50,
+        path: ".github/workflows/build.yml",
+        summary: "官方发布统一流水线。在 ubuntu-24.04-arm 上构建并发布带有官方权威摘要的 Release。",
+        duties: "1. 执行 deny.sh 确定性门禁\n2. 运行 engine/mapgen 宿主测试\n3. 编译 wasm 组件并打包 dist\n4. 运行 baselines 一致性测试与发布打标",
+        io: "输入：代码库 Push 触发\n输出：ants-artifacts.tar.gz 官方发布归档",
+        related: ["tools_deny", "tools_package", "engine_lib"],
+        rule: "官方引擎摘要仅在此流水线（aarch64 宿主）上生成，笔记本生成的哈希不能作为发布基准。"
+      }
+    ];
+
+    // 关系连线
+    const linksData = [
+      { from: "ci_build", to: "tools_deny", label: "门禁审查" },
+      { from: "ci_build", to: "tools_package", label: "发布打包" },
+      { from: "tools_deny", to: "engine_grid", label: "静态拦截" },
+      { from: "tools_package", to: "maps_files", label: "整合包络" },
+      { from: "mapgen_recipes", to: "mapgen_design", label: "DNA输入" },
+      { from: "mapgen_design", to: "mapgen_sym", label: "群论变换" },
+      { from: "mapgen_design", to: "maps_files", label: "渲染生成" },
+      { from: "mapgen_main", to: "mapgen_design", label: "命令驱动" },
+      { from: "mapgen_main", to: "mapgen_sweep", label: "执行扫描" },
+      { from: "mapgen_sweep", to: "mapgen_sym", label: "镜像验证" },
+      { from: "maps_files", to: "engine_maps", label: "对局加载" },
+      { from: "engine_lib", to: "engine_maps", label: "合法性检验" },
+      { from: "engine_lib", to: "engine_turn", label: "驱动回合" },
+      { from: "engine_lib", to: "engine_observe", label: "提取视野" },
+      { from: "engine_lib", to: "engine_codec", label: "序列化状态" },
+      { from: "engine_lib", to: "engine_replay", label: "解密重放" },
+      { from: "engine_turn", to: "engine_state", label: "更新状态" },
+      { from: "engine_turn", to: "engine_grid", label: "环面运算" },
+      { from: "engine_turn", to: "engine_food", label: "补充食物" },
+      { from: "engine_observe", to: "engine_state", label: "提取视野" },
+      { from: "engine_observe", to: "baselines_planes", label: "特征投射" },
+      { from: "baselines_planes", to: "baselines_export", label: "模型推理" },
+      { from: "baselines_teacher", to: "baselines_bc", label: "专家教学" },
+      { from: "engine_replay", to: "viz_engine", label: "Wasm解密" },
+      { from: "viz_index", to: "viz_render", label: "驱动渲染" },
+      { from: "viz_index", to: "viz_engine", label: "回放控制" },
+      { from: "viz_check", to: "viz_index", label: "静态检查" },
+      { from: "tools_equiv", to: "engine_turn", label: "等价性比对" }
+    ];
+
+    // 全局状态
+    let currentFilter = 'all';
+    let searchQuery = '';
+    let selectedNode = null;
+    let hoveredNode = null;
+
+    // 画布与交互变换状态
+    const canvas = document.getElementById('graphCanvas');
+    const ctx = canvas.getContext('2d');
+    let transform = { x: 80, y: 40, scale: 0.9 };
+    let isDragging = false;
+    let dragStart = { x: 0, y: 0 };
+
+    function resizeCanvas() {
+      canvas.width = canvas.parentElement.clientWidth;
+      canvas.height = canvas.parentElement.clientHeight;
+      draw();
+    }
+    window.addEventListener('resize', resizeCanvas);
+
+    // 绘制主循环
+    function draw() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.save();
+      ctx.translate(transform.x, transform.y);
+      ctx.scale(transform.scale, transform.scale);
+
+      // 绘制背景微网格点
+      drawGrid();
+
+      // 绘制连线
+      linksData.forEach(link => {
+        const source = modulesData.find(m => m.id === link.from);
+        const target = modulesData.find(m => m.id === link.to);
+        if (!source || !target) return;
+
+        const isFiltered = isNodeVisible(source) && isNodeVisible(target);
+        if (!isFiltered) return;
+
+        const isHighlighted = (selectedNode && (selectedNode.id === source.id || selectedNode.id === target.id)) ||
+                              (hoveredNode && (hoveredNode.id === source.id || hoveredNode.id === target.id));
+
+        ctx.beginPath();
+        const midX = (source.x + target.x) / 2;
+        const midY = (source.y + target.y) / 2;
+        ctx.moveTo(source.x, source.y);
+        ctx.quadraticCurveTo(midX, source.y, target.x, target.y);
+
+        ctx.strokeStyle = isHighlighted ? '#38bdf8' : 'rgba(100, 116, 139, 0.25)';
+        ctx.lineWidth = isHighlighted ? 2.5 : 1.2;
+        ctx.stroke();
+
+        // 关系标签
+        if (isHighlighted && link.label) {
+          ctx.font = '11px sans-serif';
+          ctx.fillStyle = '#94a3b8';
+          ctx.fillText(link.label, midX - 10, midY - 6);
+        }
+      });
+
+      // 绘制节点
+      modulesData.forEach(node => {
+        if (!isNodeVisible(node)) return;
+
+        const isSelected = selectedNode && selectedNode.id === node.id;
+        const isHovered = hoveredNode && hoveredNode.id === node.id;
+        const isMatch = searchQuery && (node.name.toLowerCase().includes(searchQuery) || node.summary.toLowerCase().includes(searchQuery));
+
+        const radius = isSelected ? 34 : (isHovered ? 30 : 26);
+
+        // 节点辉光
+        if (isSelected || isHovered || isMatch) {
+          ctx.beginPath();
+          ctx.arc(node.x, node.y, radius + 12, 0, Math.PI * 2);
+          ctx.fillStyle = node.color + '33';
+          ctx.fill();
+        }
+
+        // 节点主体圆圈
+        ctx.beginPath();
+        ctx.arc(node.x, node.y, radius, 0, Math.PI * 2);
+        ctx.fillStyle = '#0f172a';
+        ctx.fill();
+        ctx.strokeStyle = isMatch ? '#facc15' : (isSelected ? '#fff' : node.color);
+        ctx.lineWidth = isSelected ? 3.5 : 2;
+        ctx.stroke();
+
+        // 节点内核心点
+        ctx.beginPath();
+        ctx.arc(node.x, node.y, 6, 0, Math.PI * 2);
+        ctx.fillStyle = node.color;
+        ctx.fill();
+
+        // 节点标题文字
+        ctx.font = isSelected ? 'bold 13px sans-serif' : '12px sans-serif';
+        ctx.fillStyle = isSelected ? '#ffffff' : '#e2e8f0';
+        ctx.textAlign = 'center';
+        ctx.fillText(node.name, node.x, node.y + radius + 16);
+
+        // 模块标签
+        ctx.font = '10px monospace';
+        ctx.fillStyle = node.color;
+        ctx.fillText(`[${node.sub}]`, node.x, node.y + radius + 28);
+      });
+
+      ctx.restore();
+    }
+
+    function drawGrid() {
+      const step = 40;
+      ctx.fillStyle = 'rgba(51, 65, 85, 0.15)';
+      const startX = -transform.x / transform.scale - 100;
+      const endX = (canvas.width - transform.x) / transform.scale + 100;
+      const startY = -transform.y / transform.scale - 100;
+      const endY = (canvas.height - transform.y) / transform.scale + 100;
+
+      for (let x = Math.floor(startX / step) * step; x < endX; x += step) {
+        for (let y = Math.floor(startY / step) * step; y < endY; y += step) {
+          ctx.fillRect(x, y, 1.5, 1.5);
+        }
+      }
+    }
+
+    function isNodeVisible(node) {
+      if (currentFilter !== 'all' && node.sub !== currentFilter) return false;
+      return true;
+    }
+
+    // 坐标转换
+    function screenToWorld(sx, sy) {
+      return {
+        x: (sx - transform.x) / transform.scale,
+        y: (sy - transform.y) / transform.scale
+      };
+    }
+
+    function findNodeAt(sx, sy) {
+      const w = screenToWorld(sx, sy);
+      for (const node of modulesData) {
+        if (!isNodeVisible(node)) continue;
+        const dist = Math.hypot(node.x - w.x, node.y - w.y);
+        if (dist <= 30) return node;
+      }
+      return null;
+    }
+
+    // 画布鼠标事件
+    canvas.addEventListener('mousedown', (e) => {
+      const node = findNodeAt(e.offsetX, e.offsetY);
+      if (node) {
+        openDrawer(node);
+      } else {
+        isDragging = true;
+        dragStart = { x: e.clientX - transform.x, y: e.clientY - transform.y };
+      }
+      draw();
+    });
+
+    window.addEventListener('mousemove', (e) => {
+      if (isDragging) {
+        transform.x = e.clientX - dragStart.x;
+        transform.y = e.clientY - dragStart.y;
+        draw();
+      } else {
+        const rect = canvas.getBoundingClientRect();
+        const node = findNodeAt(e.clientX - rect.left, e.clientY - rect.top);
+        if (node !== hoveredNode) {
+          hoveredNode = node;
+          canvas.style.cursor = node ? 'pointer' : 'grab';
+          draw();
+        }
+      }
+    });
+
+    window.addEventListener('mouseup', () => {
+      isDragging = false;
+    });
+
+    canvas.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      const zoomFactor = 1.08;
+      const mouse = { x: e.offsetX, y: e.offsetY };
+      const worldBefore = screenToWorld(mouse.x, mouse.y);
+
+      if (e.deltaY < 0) {
+        transform.scale = Math.min(2.5, transform.scale * zoomFactor);
+      } else {
+        transform.scale = Math.max(0.3, transform.scale / zoomFactor);
+      }
+
+      transform.x = mouse.x - worldBefore.x * transform.scale;
+      transform.y = mouse.y - worldBefore.y * transform.scale;
+      draw();
+    });
+
+    // 抽屉卡片详情交互
+    const drawer = document.getElementById('detailDrawer');
+    function openDrawer(node) {
+      selectedNode = node;
+      document.getElementById('drawerBadge').textContent = node.sub.toUpperCase();
+      document.getElementById('drawerBadge').style.background = node.color + '33';
+      document.getElementById('drawerBadge').style.color = node.color;
+      document.getElementById('drawerTitle').textContent = node.name;
+      document.getElementById('drawerPath').textContent = node.path;
+      document.getElementById('drawerSummary').textContent = node.summary;
+      document.getElementById('drawerDuties').textContent = node.duties;
+      document.getElementById('drawerIO').textContent = node.io;
+      document.getElementById('drawerRule').textContent = node.rule;
+
+      const relatedContainer = document.getElementById('drawerRelated');
+      relatedContainer.innerHTML = '';
+      node.related.forEach(relId => {
+        const relNode = modulesData.find(m => m.id === relId);
+        if (relNode) {
+          const chip = document.createElement('div');
+          chip.className = 'chip';
+          chip.textContent = relNode.name;
+          chip.addEventListener('click', () => {
+            openDrawer(relNode);
+            // 视角自动平移居中该节点
+            focusNode(relNode);
+          });
+          relatedContainer.appendChild(chip);
+        }
+      });
+
+      drawer.classList.add('open');
+      draw();
+    }
+
+    function focusNode(node) {
+      transform.x = canvas.width / 2 - node.x * transform.scale;
+      transform.y = canvas.height / 2 - node.y * transform.scale;
+      draw();
+    }
+
+    document.getElementById('drawerClose').addEventListener('click', () => {
+      drawer.classList.remove('open');
+      selectedNode = null;
+      draw();
+    });
+
+    // 缩放控制按钮
+    document.getElementById('btnZoomIn').addEventListener('click', () => {
+      transform.scale = Math.min(2.5, transform.scale * 1.2);
+      draw();
+    });
+    document.getElementById('btnZoomOut').addEventListener('click', () => {
+      transform.scale = Math.max(0.3, transform.scale / 1.2);
+      draw();
+    });
+    document.getElementById('btnResetView').addEventListener('click', () => {
+      transform = { x: 80, y: 40, scale: 0.9 };
+      draw();
+    });
+
+    // 过滤器切换
+    document.querySelectorAll('.filter-pill').forEach(pill => {
+      pill.addEventListener('click', () => {
+        document.querySelectorAll('.filter-pill').forEach(p => p.classList.remove('active'));
+        pill.classList.add('active');
+        currentFilter = pill.dataset.filter;
+        renderCardsView();
+        draw();
+      });
+    });
+
+    // 视图切换（画布 vs 卡片导读墙）
+    const btnCanvasView = document.getElementById('btnCanvasView');
+    const btnCardsView = document.getElementById('btnCardsView');
+    const cardsContainer = document.getElementById('cardsContainer');
+
+    btnCanvasView.addEventListener('click', () => {
+      btnCanvasView.classList.add('active');
+      btnCardsView.classList.remove('active');
+      cardsContainer.classList.add('hidden');
+    });
+
+    btnCardsView.addEventListener('click', () => {
+      btnCardsView.classList.add('active');
+      btnCanvasView.classList.remove('active');
+      cardsContainer.classList.remove('hidden');
+      renderCardsView();
+    });
+
+    // 渲染卡片墙视图
+    function renderCardsView() {
+      cardsContainer.innerHTML = '';
+      const filtered = modulesData.filter(m => {
+        const matchesFilter = currentFilter === 'all' || m.sub === currentFilter;
+        const matchesSearch = !searchQuery || m.name.toLowerCase().includes(searchQuery) || m.summary.toLowerCase().includes(searchQuery);
+        return matchesFilter && matchesSearch;
+      });
+
+      filtered.forEach(node => {
+        const card = document.createElement('div');
+        card.className = 'code-card';
+        card.style.setProperty('--card-color', node.color);
+        card.innerHTML = `
+          <div class="card-top">
+            <span class="card-title">${node.name}</span>
+            <span class="card-tag" style="background:${node.color}22; color:${node.color}">${node.sub}</span>
+          </div>
+          <div class="card-path">${node.path}</div>
+          <div class="card-desc">${node.summary}</div>
+          <div class="card-footer">
+            <span>点击查看架构详情 & 上下游</span>
+            <span>➔</span>
+          </div>
+        `;
+        card.addEventListener('click', () => {
+          openDrawer(node);
+        });
+        cardsContainer.appendChild(card);
+      });
+    }
+
+    // 实时搜索
+    document.getElementById('searchInput').addEventListener('input', (e) => {
+      searchQuery = e.target.value.trim().toLowerCase();
+      renderCardsView();
+      draw();
+    });
+
+    // 初始化
+    resizeCanvas();
+    renderCardsView();
+  </script>
+</body>
+</html>

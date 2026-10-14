@@ -1,0 +1,13 @@
+# 可由随机种子与 90MB 数据重新生成：`python -m tb_baselines.collect`。
+data/
+# 训练检查点不是正式构件。
+runs/
+# 导出的模型亦非仓库构件：平台不提交任何权重。值得保留的模型保存在
+# ants-starter/models/（用于基准测试），或上传至赛季作为基线模型。
+models/
+replays/
+tensors/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+.venv/

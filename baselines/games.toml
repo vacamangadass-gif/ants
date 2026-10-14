@@ -1,0 +1,11 @@
+# 这些基线模型所针对训练的卡带：即其所处仓库检出树的构建产物。
+# starter 模板套件则锁定该代码树已发布的公开发行版，
+# 且 `tinybrains games` 始终会报告其解析路径。`../dist` 需要先在根目录运行 `./build.sh` ——
+# Wasm 组件、cartridge.json 以及 reference/observations.json 并不提交至 git。
+#
+# 引擎摘要（ENGINE DIGEST）是每张模型卡片的一部分。在一个引擎版本上训练而在另一个引擎版本下运行的模型
+# 无法被任何人复现，这正是 `tinybrains env` 在首行打印引擎摘要且 `export.py` 将其写入卡片的原因。
+
+[games.ants]
+name = "Ants"
+path = "../dist"

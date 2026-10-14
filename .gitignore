@@ -1,0 +1,7 @@
+# The build tree.
+target/
+
+# Every artifact: the component, its manifests, the boards, the reference observations and the
+# viewer, laid out exactly as a release archive carries them. build.sh and viz/build.sh write it;
+# nothing in it is committed, and nothing outside it is generated.
+dist/

@@ -1,0 +1,25 @@
+[project]
+name = "tb-baselines"
+version = "0.1.0"
+description = "TinyBrains Ants 的预训练基线模型，以及完整的训练流程示例"
+requires-python = ">=3.11"          # tomllib
+dependencies = [
+    "numpy>=1.26",
+    "torch>=2.2",
+    # 仅用于计算图手术（graph surgery）：export.py 中的 fp16 初始化器重写。此处绝不运行计算图 ——
+    # 由 `tinybrains check` 通过与集群完全相同的 datalogic 和 tract 运行，这防止了本仓库对其自身模型的行为产生第二种主观臆测。
+    "onnx>=1.16",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
