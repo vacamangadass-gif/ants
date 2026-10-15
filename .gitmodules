@@ -4,4 +4,7 @@
 [submodule "ants-dev"]
 	path = ants-dev
 	url = https://github.com/vacamangadass-gif/ants-dev.git
+[submodule ".agents"]
+	path = .agents
+	url = https://github.com/vacamangadass-gif/ants-agents.git
 

@@ -82,7 +82,7 @@ def test_a_mixed_pool_refuses_to_pretend_it_is_one_batch():
     try:
         step = e.reset()
         assert len(step.groups) > 1, "三个波次抽取了基础棋盘中的三种"
-        with pytest.raises(EnvError, match="board sizes"):
+        with pytest.raises(EnvError, match=r"(board sizes|棋盘尺寸)"):
             _ = step.boards
         assert sum(len(g.indices) for g in step.groups) == len(step.seats)
         for g in step.groups:

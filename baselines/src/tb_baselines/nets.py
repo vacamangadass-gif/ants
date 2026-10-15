@@ -44,7 +44,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .planes import ANT_MEMORY, MEMORY_SOURCES, N_MEMORY, N_MOVES, N_PLANES
+from .planes import ANT_MEMORY, MEMORY_SOURCES, N_MEMORY, N_MOVES, N_PLANES, VIS_SOURCE
 
 
 def wrap(x: torch.Tensor, k: int) -> torch.Tensor:
@@ -202,30 +202,41 @@ class PerCell(nn.Module):
 class WithMemory(nn.Module):
     """读取棋盘及座位记忆，并将更新后的记忆写回的主干网络包装器。
 
-    记忆结构对应 `planes.MEMORY`：视图在回合间遗忘的两个 0/1 平面，通过 `Max` 算子维护。
+    记忆结构对应 `planes.MEMORY`：视图在回合间遗忘的两个 0/1 平面。
+    更新模式支持 'where'（默认，基于视野掩码的条件选择更新，清除已摧毁敌丘幽灵残留）
+    与 'max'（传统并集累积，供消融实验使用）。
     它是座位历史所见内容的固定函数，因此除读取它的策略网络外无任何可学习参数。主干网络基于
     `N_PLANES + N_MEMORY` 个输入通道构建，接收棋盘与记忆堆叠后的张量。更新计算在 float 下运行并强转回原类型，
-    因此计算图在 float 上执行 `Max`（所有运行时均支持的变体）并输出 `i8`，与清单声明及棋盘一致的数据类型。
+    输出 `i8`，与清单声明及棋盘一致的数据类型。
     `export.to_onnx` 将端口命名为 `board`, `memory_in`, `policy` 和 `memory`，与生成的清单完全匹配。
     """
 
     memory_ports = True     # 导出时在 `board` 和 `policy` 旁附带 `memory_in` 与 `memory`
-    memory_kind = "max"
+    memory_kind = "where"
 
-    def __init__(self, trunk: nn.Module):
+    def __init__(self, trunk: nn.Module, mode: str = "where"):
         super().__init__()
         self.trunk = trunk
         self.channels = trunk.channels
+        self.mode = mode
+        self.memory_kind = mode
         self.register_buffer("sources", torch.tensor(MEMORY_SOURCES, dtype=torch.long))
 
     def read(self, memory_in: torch.Tensor) -> torch.Tensor:
         """主干网络所看到的记忆平面。"""
         return memory_in.float()
 
-    def write(self, f: torch.Tensor, board: torch.Tensor, memory_in: torch.Tensor) -> torch.Tensor:
+    def write(self, f: torch.Tensor, board: torch.Tensor, memory_in: torch.Tensor, mode: str | None = None) -> torch.Tensor:
         """写入下一回合的记忆。"""
+        m = self.mode if mode is None else mode
         seen = board.index_select(1, self.sources).float()
-        return torch.maximum(memory_in.float(), seen).to(torch.int8)
+        if m == "where":
+            vis = (board[:, 6:7] != 0)
+            return torch.where(vis, seen, memory_in.float()).to(torch.int8)
+        elif m == "max":
+            return torch.maximum(memory_in.float(), seen).to(torch.int8)
+        else:
+            raise ValueError(f"未知的记忆更新模式 '{m}'（可用项：'where', 'max'）")
 
     def forward(self, board: torch.Tensor, memory_in: torch.Tensor):
         f = self.trunk.features(torch.cat([board.float(), self.read(memory_in)], dim=1))
@@ -350,20 +361,22 @@ class PerAnt(nn.Module):
 
 ARCHS = {"trunk": Trunk, "encdec": EncDec, "percell": PerCell}
 
-MEMORIES = {"max": WithMemory, "learned": LearnedMemory}
-MEMORY_PLANES = {"max": N_MEMORY, "learned": N_MEMORY}
+MEMORIES = {"where": WithMemory, "max": WithMemory, "learned": LearnedMemory}
+MEMORY_PLANES = {"where": N_MEMORY, "max": N_MEMORY, "learned": N_MEMORY}
 ANT_PLANES = {"learned": ANT_MEMORY}
 
 
 def build(spec: dict, memory: bool | str = False, ants: bool | str = False) -> nn.Module:
     """根据 `classes.toml` 中的规格配置构建 PyTorch 模型；指定 `memory` 时构建携带棋盘记忆的模型：
-    `"max"`（或 True）代表通过 `Max` 维护的 `planes.MEMORY`，`"learned"` 代表 `LearnedMemory`；
+    `"where"`（或 True）代表基于可见性掩码 Where 维护的 `planes.MEMORY`；
+    `"max"` 代表通过 `Max` 维护的传统记忆（供消融使用）；
+    `"learned"` 代表 `LearnedMemory`；
     指定 `ants` 时同时携带单蚁记忆：`"learned"`（或 True）由计算图自主学习。"""
     arch = spec["arch"]
     if arch not in ARCHS:
         raise ValueError(f"未知的网络架构 '{arch}'（可用项：{', '.join(sorted(ARCHS))}）")
     kwargs = {k: spec[k] for k in ("channels", "stride", "blocks", "dilate") if k in spec}
-    mkind = ("max" if memory is True else memory) if memory else None
+    mkind = ("where" if memory is True else memory) if memory else None
     akind = ("learned" if ants is True else ants) if ants else None
     if mkind and mkind not in MEMORIES:
         raise ValueError(f"未知的记忆类型 '{mkind}'（可用项：{', '.join(sorted(MEMORIES))}）")
@@ -372,7 +385,12 @@ def build(spec: dict, memory: bool | str = False, ants: bool | str = False) -> n
     if mkind or akind:
         kwargs["planes"] = N_PLANES + (MEMORY_PLANES[mkind] if mkind else 0) + (ANT_PLANES[akind] if akind else 0)
     net = ARCHS[arch](**kwargs)
-    inner = MEMORIES[mkind](net) if mkind else None
+    if mkind in ("where", "max"):
+        inner = WithMemory(net, mode=mkind)
+    elif mkind:
+        inner = MEMORIES[mkind](net)
+    else:
+        inner = None
     if akind:
         return PerAnt(net, inner, kind=akind)
     return inner or net
