@@ -1,3 +1,7 @@
 [submodule "tinybrain"]
 	path = tinybrain
 	url = https://github.com/vacamangadass-gif/tinybrain.git
+[submodule "ants-dev"]
+	path = ants-dev
+	url = https://github.com/vacamangadass-gif/ants-dev.git
+
