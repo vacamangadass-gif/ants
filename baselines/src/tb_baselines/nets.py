@@ -44,7 +44,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .planes import ANT_MEMORY, MEMORY_SOURCES, N_MEMORY, N_MOVES, N_PLANES, VIS_SOURCE
+from .planes import ANT_MEMORY, MEMORY_SOURCES, N_MEMORY, N_MOVES, N_PLANES
 
 
 def wrap(x: torch.Tensor, k: int) -> torch.Tensor:
@@ -108,8 +108,16 @@ def doubling(n: int, cap: int = 8) -> list[int]:
 class Trunk(nn.Module):
     """全分辨率下的全卷积架构：对应 nano 和 micro 等级。
 
+    对于 micro 等级（`channels=28`, `blocks=3`）：
+    - 4 层空洞 3x3 卷积（`Stage`），空洞率分别为 `[1, 2, 4, 8]`；
+    - 单向感知距离 reach 为 15 格（1+2+4+8），感受野覆盖为 31x31（2*15+1）；
+    - 前端统一执行一次环面环绕填充（`wrap(x, reach=15)`）；
+    - 若携带 Where 记忆（`mode="where"`），输入为 9 通道（7 板面 + 2 记忆面），
+      总物理参数量严格为 24,505 个（conv0: 2,296, conv1-3: 3*7,084, mix: 812, head: 145）；
+    - 若无记忆，输入为 7 通道，总物理参数量严格为 24,001 个。
+
     包含一个空洞 3x3 卷积 stage，随后接若干 1x1 卷积层；1x1 卷积仅以 3x3 九分之一的开销增加网络深度 ——
-    在总预算仅有几千个参数时这是绝佳的折衷设计。不使用归一化层：在这些通道宽度下归一化参数占了预算的可观比例，
+    在总预算仅有几千到几万个参数时这是绝佳的折衷设计。不使用归一化层：在这些通道宽度下归一化参数占了预算的可观比例，
     且输入特征平面本身已是 0/1 二值平面。
 
     `dilate=False` 用于复现早期模型使用的无空洞堆叠架构。保留它是为了对比其实验发现，而非仅作为技术备注。

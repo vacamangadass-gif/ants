@@ -457,7 +457,8 @@ def export(trunk: torch.nn.Module, name: str, out: Path, method: str, repro: str
     return metrics
 
 
-def main(argv: list[str] | None = None) -> None:
+def build_parser() -> argparse.ArgumentParser:
+    """构建 export 命令的命令行参数解析器。"""
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--class", dest="cls", required=True)
     # 变体模型通过命令行参数控制，而非维护第二张表格：运行生成的 history.json 和模型卡片
@@ -466,8 +467,8 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--channels", type=int, default=None)
     ap.add_argument("--blocks", type=int, default=None)
     ap.add_argument("--weights", type=Path, help=".pt 格式的权重字典；缺省时采用随机初始化")
-    ap.add_argument("--memory", nargs="?", const="max", default=False,
-                    help="构建携带记忆的模型：`max`（planes.MEMORY）或 `learned`；"
+    ap.add_argument("--memory", nargs="?", const="where", default=False,
+                    help="构建携带记忆的模型：`where`（默认）、`max`（消融）或 `learned`；"
                          "当权重中声明记忆时会自动从中读取")
     ap.add_argument("--ants", nargs="?", const="learned", default=False,
                     help="构建同时携带单蚁记忆的模型：`learned`；同样可从权重中自动读取")
@@ -475,8 +476,14 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--method", default="untrained")
     ap.add_argument("--repro", default=None,
                     help="模型卡片的 Reproduce 复现模块内容（默认：数据集采集、训练运行及本次导出的自动记录命令）")
+    return ap
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = build_parser().parse_args(argv)
     argv = sys.argv[1:] if argv is None else argv
-    a = ap.parse_args(argv)
+    a = args
+
 
     from .train.bc import override
     spec = override(classes()[a.cls], a)
