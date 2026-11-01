@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 from dataclasses import asdict, dataclass, field
@@ -124,6 +125,22 @@ class EntrantStats:
     def mean_infer_us_per_turn(self) -> float:
         return (self.infer_us_total / self.total_turns) if self.total_turns > 0 else 0.0
 
+    def to_dict(self) -> Dict[str, Any]:
+        data = asdict(self)
+        data["score_rate"] = round(self.score_rate, 4)
+        data["win_rate"] = round(self.win_rate, 4)
+        data["blocked_move_pct"] = round(self.blocked_order_rate, 4)
+        data["mean_raze_turn"] = round(self.mean_destroy_turn_success, 2) if self.mean_destroy_turn_success is not None else None
+        data["mean_survive_turn"] = round(self.mean_survival_turns_loss, 2) if self.mean_survival_turns_loss is not None else None
+        data["hill_raze_rate"] = round(self.hill_raze_rate, 4)
+        data["mean_score_for"] = round(self.mean_score_for, 2)
+        data["mean_score_against"] = round(self.mean_score_against, 2)
+        data["mean_food_gathered"] = round(self.mean_food_gathered, 2)
+        data["mean_collisions"] = round(self.mean_collisions, 2)
+        data["mean_combat_deaths"] = round(self.mean_combat_deaths, 2)
+        data["mean_infer_us_per_turn"] = round(self.mean_infer_us_per_turn, 2)
+        return data
+
 
 @dataclass
 class HeadToHeadStats:
@@ -151,6 +168,13 @@ class HeadToHeadStats:
     def p1_mean_destroy_turn(self) -> Optional[float]:
         return sum(self.p1_raze_turns) / len(self.p1_raze_turns) if self.p1_raze_turns else None
 
+    def to_dict(self) -> Dict[str, Any]:
+        data = asdict(self)
+        data["p1_score_rate"] = round(self.p1_score_rate, 4)
+        data["p1_win_rate"] = round(self.p1_win_rate, 4)
+        data["p1_mean_destroy_turn"] = round(self.p1_mean_destroy_turn, 2) if self.p1_mean_destroy_turn is not None else None
+        return data
+
 
 def extract_raw_metrics(replays_path: Path) -> List[Dict[str, Any]]:
     """Runs extract_frames.mjs via Node to extract frame-level metrics using jco Wasm component."""
@@ -161,14 +185,14 @@ def extract_raw_metrics(replays_path: Path) -> List[Dict[str, Any]]:
     return json.loads(res.stdout)
 
 
-def aggregate_tournament(raw_matches: List[Dict[str, Any]]) -> Tuple[Dict[str, EntrantStats], Dict[Tuple[str, str], HeadToHeadStats], List[str]]:
-    """Aggregates match results into entrant stats and pairwise head-to-head cross matrices."""
-    entrants_set = set()
-    for m in raw_matches:
-        for s in m["seats"]:
-            entrants_set.add(s["name"])
+def infer_model_class(name: str) -> str:
+    lower_name = name.lower()
+    if "exp033" in lower_name or "micro" in lower_name:
+        return "micro"
+    return "nano"
 
-    # Canonical order for display and consistency
+
+def sort_entrant_key(name: str) -> Tuple[int, Any]:
     canonical_order = [
         "exp031",
         "exp030",
@@ -176,11 +200,23 @@ def aggregate_tournament(raw_matches: List[Dict[str, Any]]) -> Tuple[Dict[str, E
         "nano-bc-max-r",
         "nano-bc",
     ]
-    sort_key = {name: i for i, name in enumerate(canonical_order)}
-    entrants = sorted(list(entrants_set), key=lambda x: sort_key.get(x, 99))
+    if name in canonical_order:
+        return (0, canonical_order.index(name))
+    parts = [int(token) if token.isdigit() else token.lower() for token in re.split(r"(\d+)", name)]
+    return (1, parts)
+
+
+def aggregate_tournament(raw_matches: List[Dict[str, Any]]) -> Tuple[Dict[str, EntrantStats], Dict[Tuple[str, str], HeadToHeadStats], List[str]]:
+    """Aggregates match results into entrant stats and pairwise head-to-head cross matrices."""
+    entrants_set = set()
+    for m in raw_matches:
+        for s in m["seats"]:
+            entrants_set.add(s["name"])
+
+    entrants = sorted(list(entrants_set), key=sort_entrant_key)
 
     stats: Dict[str, EntrantStats] = {
-        name: EntrantStats(name=name, model_class="nano")
+        name: EntrantStats(name=name, model_class=infer_model_class(name))
         for name in entrants
     }
     h2h: Dict[Tuple[str, str], HeadToHeadStats] = {}
@@ -274,7 +310,10 @@ def generate_markdown_report(
     lines.append("# TinyBrains Ants IDEA-006: 9-Map Round-Robin Tournament Metric Evaluation Report (Milestone 3)")
     lines.append("")
     lines.append("## 1. Executive Summary")
-    lines.append(f"- **Total Tournament Matches Evaluated**: {len(raw_matches)} (Expected: 180 matches across 10 pairs × 2 reciprocal flips × 9 maps)")
+    num_p = len(entrants)
+    num_pairs = num_p * (num_p - 1) // 2
+    maps_count = (len(raw_matches) // (num_p * (num_p - 1))) if (num_p > 1 and len(raw_matches) > 0) else 9
+    lines.append(f"- **Total Tournament Matches Evaluated**: {len(raw_matches)} (Expected: {len(raw_matches)} matches across {num_pairs} pairs × 2 reciprocal flips × {maps_count} maps)")
     lines.append(f"- **Participants ({len(entrants)})**: {', '.join(f'`{e}`' for e in entrants)}")
     if raw_matches:
         lines.append(f"- **Game Engine Digest**: `{raw_matches[0].get('engine_digest', 'unknown')}` (Invariant verified)")
@@ -302,8 +341,8 @@ def generate_markdown_report(
         )
     lines.append("")
 
-    # Table 2: 5x5 Pairwise Score Rate Cross-Matrix
-    lines.append("## 3. Pairwise Score Rate Cross-Matrix (5×5) (Table 2)")
+    # Table 2: Pairwise Score Rate Cross-Matrix
+    lines.append(f"## 3. Pairwise Score Rate Cross-Matrix ({num_p}×{num_p}) (Table 2)")
     lines.append("Rows represent the focal model; columns represent the opponent. Cell indicates Row vs Column Score Rate % (`Points / Matches`) and record `(W-D-L)` across 18 matches.")
     lines.append("")
     header = "| Row \\ Col | " + " | ".join(f"`{e}`" for e in entrants) + " | **Overall Score Rate** |"
@@ -328,8 +367,8 @@ def generate_markdown_report(
         lines.append("| " + " | ".join(row_cells) + " |")
     lines.append("")
 
-    # Table 3: 5x5 Pairwise Mean Hill Destroy Turn Matrix
-    lines.append("## 4. Pairwise Mean Hill Destroy Turn Matrix (5×5) (Table 3)")
+    # Table 3: Pairwise Mean Hill Destroy Turn Matrix
+    lines.append(f"## 4. Pairwise Mean Hill Destroy Turn Matrix ({num_p}×{num_p}) (Table 3)")
     lines.append("Cell indicates average turn when Row destroyed Column's hill (Successful raze matches only / count of razes n).")
     lines.append("")
     lines.append(header.replace("**Overall Score Rate**", "**Overall Mean Raze Turn**"))
@@ -450,15 +489,26 @@ def run_verification_assertions(
     raw_matches: List[Dict[str, Any]],
     stats: Dict[str, EntrantStats],
     h2h: Dict[Tuple[str, str], HeadToHeadStats],
+    expected_entrants: Optional[int] = None,
+    expected_maps: int = 9,
+    expected_matches: Optional[int] = None,
 ) -> None:
     """Automated assertions asserting complete mathematical consistency and tournament integrity."""
     print("==> Running Phase 3 Milestone 3 Verification Assertions...")
 
-    # 1. Total matches check (180 matches)
-    assert len(raw_matches) == 180, f"Expected 180 matches, got {len(raw_matches)}"
+    num_entrants = len(stats)
+    assert num_entrants >= 2, f"Tournament requires at least 2 entrants, got {num_entrants}"
+    if expected_entrants is not None:
+        assert num_entrants == expected_entrants, f"Expected {expected_entrants} entrants, got {num_entrants}"
 
-    # 2. Entrant count check (5 entrants)
-    assert len(stats) == 5, f"Expected 5 entrants, got {len(stats)}"
+    # Auto-detect or use specified maps count
+    detected_maps = len({m.get("map_id") for m in raw_matches if m.get("map_id")})
+    num_maps = detected_maps if detected_maps > 0 else expected_maps
+
+    pair_matches = num_maps * 2
+    computed_total_matches = num_entrants * (num_entrants - 1) * num_maps
+    expected_total = expected_matches if expected_matches is not None else computed_total_matches
+    assert len(raw_matches) == expected_total, f"Expected {expected_total} matches, got {len(raw_matches)}"
 
     # 3. Engine digest consistency
     first_digest = raw_matches[0].get("engine_digest")
@@ -468,21 +518,23 @@ def run_verification_assertions(
         assert m.get("engine_digest") == first_digest, f"Divergent engine digest in match {m['match_id']}"
     print(f"  [PASS] Engine digest identical and invariant across all {len(raw_matches)} matches ({first_digest[:24]}...).")
 
-    # 4. Reciprocal match and pairwise symmetry across all 10 pairs (20 ordered pairs)
-    assert len(h2h) == 20, f"Expected 20 ordered pairs (10 unordered pairs), got {len(h2h)}"
+    # 4. Reciprocal match and pairwise symmetry across all pairs
+    expected_ordered_pairs = num_entrants * (num_entrants - 1)
+    assert len(h2h) == expected_ordered_pairs, f"Expected {expected_ordered_pairs} ordered pairs, got {len(h2h)}"
     for (p1, p2), h in h2h.items():
         rev = h2h[(p2, p1)]
-        assert h.matches == 18, f"Expected 18 matches between {p1} and {p2}, got {h.matches}"
+        assert h.matches == pair_matches, f"Expected {pair_matches} matches between {p1} and {p2}, got {h.matches}"
         assert h.matches == rev.matches, f"Match count asymmetry between {p1} and {p2}"
         assert h.p1_wins == rev.p2_wins, f"Win asymmetry between {p1} and {p2}: {h.p1_wins} vs {rev.p2_wins}"
         assert h.draws == rev.draws, f"Draw asymmetry between {p1} and {p2}: {h.draws} vs {rev.draws}"
         total_points = h.p1_points + rev.p1_points
         assert abs(total_points - h.matches) < 1e-5, f"Points sum != matches for {p1} and {p2}"
-    print("  [PASS] Reciprocal seat swap and pairwise symmetry strictly verified across all 10 pairs (18 matches/pair).")
+    print(f"  [PASS] Reciprocal seat swap and pairwise symmetry strictly verified across all {expected_ordered_pairs} ordered pairs ({pair_matches} matches/pair).")
 
-    # 5. Metric bounds, match counts (72 matches/entrant), and latency check
+    # 5. Metric bounds, match counts per entrant, and latency check
+    expected_matches_per_entrant = (num_entrants - 1) * pair_matches
     for name, s in stats.items():
-        assert s.matches == 72, f"Expected 72 matches per entrant, got {s.matches} for {name}"
+        assert s.matches == expected_matches_per_entrant, f"Expected {expected_matches_per_entrant} matches per entrant, got {s.matches} for {name}"
         assert 0.0 <= s.score_rate <= 1.0, f"Score rate out of bounds for {name}: {s.score_rate}"
         assert 0.0 <= s.win_rate <= 1.0, f"Win rate out of bounds for {name}: {s.win_rate}"
         assert s.matches == (s.wins + s.draws + s.losses), f"Matches sum mismatch for {name}"
@@ -491,7 +543,7 @@ def run_verification_assertions(
         assert s.blocked_orders >= 0, f"Negative blocked orders for {name}"
         assert s.total_orders >= s.blocked_orders, f"Blocked orders > total orders for {name}"
         assert s.infer_us_max <= 700_000, f"Platform latency deadline violated (>700ms) for {name}: {s.infer_us_max} us"
-    print("  [PASS] Mathematical metric bounds, 72 matches per entrant, and platform latency (<700ms) verified for all 5 entrants.")
+    print(f"  [PASS] Mathematical metric bounds, {expected_matches_per_entrant} matches per entrant, and platform latency (<700ms) verified for all {num_entrants} entrants.")
     print("==> All Milestone 3 verification assertions passed successfully!")
 
 
@@ -501,6 +553,9 @@ def main(argv: Optional[List[str]] = None) -> None:
     parser.add_argument("--out-dir", type=Path, default=Path("data/tournament_p3_results"), help="Directory for output report and JSON")
     parser.add_argument("--json", dest="emit_json", action="store_true", help="Emit raw JSON aggregation to stdout")
     parser.add_argument("--verify", action="store_true", default=True, help="Run strict automated assertions")
+    parser.add_argument("--expected-entrants", type=int, default=None, help="Explicit expected participant count (e.g. 16)")
+    parser.add_argument("--expected-maps", type=int, default=9, help="Expected map count (default 9)")
+    parser.add_argument("--expected-matches", type=int, default=None, help="Explicit expected total matches (e.g. 2160)")
     args = parser.parse_args(argv)
 
     replays_path = args.replays_dir.resolve()
@@ -513,8 +568,15 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     stats, h2h, entrants = aggregate_tournament(raw_matches)
 
-    if args.verify or len(raw_matches) == 180:
-        run_verification_assertions(raw_matches, stats, h2h)
+    if args.verify:
+        run_verification_assertions(
+            raw_matches,
+            stats,
+            h2h,
+            expected_entrants=args.expected_entrants,
+            expected_maps=args.expected_maps,
+            expected_matches=args.expected_matches,
+        )
 
     out_dir = args.out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -581,8 +643,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         "entrants": entrants,
         "total_matches": len(raw_matches),
         "engine_digest": raw_matches[0].get("engine_digest") if raw_matches else "",
-        "leaderboard": [asdict(s) for s in sorted_by_rate],
-        "head_to_head": {f"{k[0]}_vs_{k[1]}": asdict(v) for k, v in h2h.items()},
+        "leaderboard": [s.to_dict() for s in sorted_by_rate],
+        "head_to_head": {f"{k[0]}_vs_{k[1]}": v.to_dict() for k, v in h2h.items()},
         "scientific_comparisons": scientific_comparisons,
     }
     json_path = out_dir / "tournament_metrics.json"
