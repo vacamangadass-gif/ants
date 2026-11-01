@@ -54,9 +54,9 @@ def board_adapter() -> dict:
 
 def manifest(name: str = "tb.baseline", version: str = "1", memory: bool | str = False,
              ants: bool | str = False) -> dict:
-    """`memory` 为 False、True 或 `"max"`（`planes.MEMORY`，`i8`）或 `"learned"`（相同的端口）；
+    """`memory` 为 False、True 或 `"where"`（默认）、`"max"`（`planes.MEMORY`，`i8`）或 `"learned"`（相同的端口）；
     `ants` 为 False、True 或 `"learned"`（每只蚂蚁对应 `planes.ANT_MEMORY` 个数值）。"""
-    mkind = ("max" if memory is True else memory) if memory else None
+    mkind = ("where" if memory is True else memory) if memory else None
     akind = ("learned" if ants is True else ants) if ants else None
     inputs = [
         {
@@ -70,7 +70,7 @@ def manifest(name: str = "tb.baseline", version: str = "1", memory: bool | str =
     # 且通道顺序遵循游戏的动作定义（`planes.MOVES`）。
     outputs = [{"name": "policy", "dtype": "f32", "shape": [1, N_MOVES, "H", "W"]}]
     description = "A TinyBrains Ants entry: seven planes in, a per-cell policy out."
-    if mkind in ("max", "learned"):
+    if mkind in ("where", "max", "learned"):
         # 记忆与棋盘一样采用 `i8`：两个 0/1 平面，按每个单元格 2 字节计费。
         shape = [1, N_MEMORY, "H", "W"]
         inputs.append({"name": "memory_in", "dtype": DTYPE, "shape": shape,

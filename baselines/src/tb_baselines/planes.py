@@ -251,6 +251,9 @@ N_MEMORY = len(MEMORY)
 MEMORY_SOURCES: tuple[int, ...] = tuple(
     next(i for i, p in enumerate(PLANES) if p.name == m.source) for m in MEMORY
 )
+# `PLANES` 中可见性掩码（visible）平面的通道索引，用于条件选择更新记忆。
+VIS_SOURCE: int = 6
+assert PLANES[VIS_SOURCE].name == "visible", f"VIS_SOURCE {VIS_SOURCE} must point to 'visible'"
 
 
 def memory_adapter(size) -> dict:
@@ -268,20 +271,41 @@ def memory_adapter(size) -> dict:
     }
 
 
-def remember(state: dict | None, obs: dict) -> dict:
-    """计入当前观测后一个座位所见的内容：`state` 加上本回合新增的单元格。
+def remember(state: dict | None, obs: dict, mode: str = "where") -> dict:
+    """计入当前观测后一个座位所见的内容：依据更新模式融合历史记忆与本回合观测。
 
     `state` 格式为 `{name: [[r, c], ...]}`，经排序且无重复项 —— 与 `collect.py` 写入数据集行的格式相同 ——
-    在第 0 回合为 None。0/1 平面的并集等价于它们的 `Max` 运算，这正是计算图所执行的更新操作；
-    一致性测试会断言两者的计算结果完全一致。
+    在第 0 回合为 None。
+
+    更新模式 `mode`：
+    - "where"（默认，IDEA-002 可见性校正）：
+      提取当前可见性掩码 V_t。对于当前视野内（V_t == 1）的单元格，以当前观测 O_t 覆盖；
+      对于迷雾遮挡（V_t == 0）的单元格，保留历史记忆 M_t。
+      从而在敌方蚁丘被摧毁进入视野后彻底消除残留，杜绝“幽灵敌丘”导致的无效折返。
+      与计算图端 `torch.where(vis, seen, memory_in)` 逐位严格等价。
+    - "max"（基准/消融实验，EXP-010 / EXP-012）：
+      保留原始单调并集累积 M_{t+1} = M_t ∪ O_t，等价于 `torch.maximum(memory_in, seen)`。
     """
     rows, cols = obs["size"]
     b = Board(rows, cols)
     out = {}
-    for m, k in zip(MEMORY, MEMORY_SOURCES):
-        seen = {tuple(p) for p in (state or {}).get(m.name, [])}
-        seen |= {(int(r), int(c)) for r, c in np.argwhere(PLANES[k].numpy(obs, b) != 0)}
-        out[m.name] = [list(p) for p in sorted(seen)]
+    if mode == "where":
+        vis = PLANES[VIS_SOURCE].numpy(obs, b)
+        for m, k in zip(MEMORY, MEMORY_SOURCES):
+            curr_pts = {(int(r), int(c)) for r, c in np.argwhere(PLANES[k].numpy(obs, b) != 0)}
+            prev_pts = {
+                (int(r), int(c))
+                for r, c in (state or {}).get(m.name, [])
+                if 0 <= r < rows and 0 <= c < cols and vis[r, c] == 0
+            }
+            out[m.name] = [list(p) for p in sorted(prev_pts | curr_pts)]
+    elif mode == "max":
+        for m, k in zip(MEMORY, MEMORY_SOURCES):
+            seen = {tuple(p) for p in (state or {}).get(m.name, [])}
+            seen |= {(int(r), int(c)) for r, c in np.argwhere(PLANES[k].numpy(obs, b) != 0)}
+            out[m.name] = [list(p) for p in sorted(seen)]
+    else:
+        raise ValueError(f"unknown memory mode: {mode!r}; expected 'where' or 'max'")
     return out
 
 

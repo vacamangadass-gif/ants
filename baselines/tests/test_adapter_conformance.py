@@ -54,6 +54,9 @@ def dumped(tmp_path_factory):
         if named:
             pytest.fail(f"TB_CONFORMANCE_ONNX names {onnx}, which does not exist")
         pytest.skip(f"no trained graph to load the manifest against: set TB_CONFORMANCE_ONNX, or check out ants-starter beside ants ({onnx})")
+    dist = ROOT.parent / "dist"
+    if not dist.exists():
+        pytest.skip(f"no prebuilt dist/ at {dist}; run ./build.sh or provide release artifacts")
     out = tmp_path_factory.mktemp("tensors")
     manifest = out / "manifest.json"
     manifest.write_text(adapters.dumps())
@@ -232,9 +235,10 @@ def test_the_memory_manifest_declares_the_two_ports_beside_the_board():
     assert json.loads(adapters.dumps())["inputs"][0] == doc["inputs"][0], "the board adapter is the same"
 
 
-def test_remember_is_the_max_the_graph_takes(dumped):
-    """训练器的更新逻辑（`remember`，单元格的并集）与计算图的更新逻辑
-    （在记忆面与来源特征面上执行 `Max`）必须是同一函数。在 0/1 特征面上它们确实等价，
+def test_remember_is_the_where_the_graph_takes(dumped):
+    """训练器的更新逻辑（`remember`，条件化视野覆盖更新）与计算图的更新逻辑
+    （在记忆面、来源特征面与视野掩码上执行 `Where`）必须是同一函数。
+    当前可见区域（vis=1）采用当前观测 sources，迷雾区域（vis=0）保留历史记忆 before。
     本测试在按棋盘尺寸串联的参考观测上断言这一点；第 0 回合为全零。"""
     for state, obs in chained(cases_of(dumped)):
         size = obs["size"]
@@ -242,9 +246,139 @@ def test_remember_is_the_max_the_graph_takes(dumped):
         if state is None:
             assert before.sum() == 0 and before.dtype == planes.NP_DTYPE
         after = planes.encode_memory(planes.remember(state, obs), size)
-        sources = planes.encode(obs)[:, list(planes.MEMORY_SOURCES)]
+        encoded = planes.encode(obs)
+        sources = encoded[:, list(planes.MEMORY_SOURCES)]
+        vis = encoded[:, [planes.VIS_SOURCE]] != 0
         assert after.shape == (1, planes.N_MEMORY, *size) and after.dtype == planes.NP_DTYPE
-        assert np.array_equal(after, np.maximum(before, sources)), f"remember is not Max at {size}"
+        assert np.array_equal(after, np.where(vis, sources, before)), f"remember is not Where at {size}"
+
+
+test_remember_is_the_max_the_graph_takes = test_remember_is_the_where_the_graph_takes
+
+
+def test_remember_where_razed_hill_cleared_in_view_and_retained_in_fog():
+    """显式验证 IDEA-002 核心假设：
+    当敌丘在当前视野中被摧毁（Ot=0, Vt=1）时，历史记忆清除归零（消除幽灵残留）；
+    而处于战争迷雾中的敌丘（Vt=0），原有历史记忆 Mt 完好保留。
+    同时对比验证 mode='max' 依然会产生幽灵敌丘缺陷。
+    """
+    rows, cols = 16, 16
+    b = planes.Board(rows, cols)
+
+    # 己方蚂蚁位于 (5, 4)
+    mine = [[5, 4]]
+    mine_plane = b.scatter(mine)
+    vis_plane = b.dilate(mine_plane, planes.VIEW_RADIUS2)
+
+    # 验证视野覆盖：(5, 5) 必定在视野内，(12, 12) 必定在迷雾中
+    assert vis_plane[5, 5] == 1, "点 (5, 5) 距离蚂蚁 (5, 4) 仅 1 格，必须在视野内 (Vt=1)"
+    assert vis_plane[12, 12] == 0, "点 (12, 12) 距离蚂蚁欧氏平方 113 > 77，必须在迷雾中 (Vt=0)"
+
+    # 将 vis_plane 编码为合法 RLE 游程
+    flat = vis_plane.ravel()
+    diffs = np.diff(flat)
+    change_indices = np.where(diffs != 0)[0] + 1
+    split_points = [0] + change_indices.tolist() + [len(flat)]
+    rle_runs = []
+    for start, end in zip(split_points[:-1], split_points[1:]):
+        rle_runs.extend([int(flat[start]), end - start])
+
+    obs = {
+        "size": [rows, cols],
+        "mine": mine,
+        "foes": [],
+        "food": [],
+        "hills": [],  # 敌丘已被摧毁，无任何可见蚁穴 (Ot=0)
+        "water": {"rle": [0, rows * cols]},
+        "vis": {"rle": rle_runs},
+    }
+
+    # 上一回合记忆包含两个敌丘坐标
+    state = {"food_seen": [], "hill_foe_seen": [[5, 5], [12, 12]]}
+
+    # 1. 验证 mode="where"（默认）
+    after_where = planes.remember(state, obs, mode="where")
+    # (5, 5) 在视野内确认为空，必须被消除；(12, 12) 在迷雾中，必须保留
+    assert after_where["hill_foe_seen"] == [[12, 12]], (
+        f"Where 模式未能清除已探明摧毁的敌丘 (5, 5) 或丢失了迷雾记忆 (12, 12): {after_where['hill_foe_seen']}"
+    )
+
+    # 验证与张量级 np.where 逐位完全一致
+    before_t = planes.encode_memory(state, [rows, cols])
+    after_t = planes.encode_memory(after_where, [rows, cols])
+    encoded_obs = planes.encode(obs)
+    sources_t = encoded_obs[:, list(planes.MEMORY_SOURCES)]
+    vis_t = encoded_obs[:, [planes.VIS_SOURCE]] != 0
+    expected_t = np.where(vis_t, sources_t, before_t)
+    assert np.array_equal(after_t, expected_t), "NumPy 状态编码与张量 np.where 不一致"
+
+    # 2. 验证 mode="max"（对照消融）
+    after_max = planes.remember(state, obs, mode="max")
+    # max 模式因 max(1, 0) = 1，必定保留 (5, 5) 幽灵残留
+    assert after_max["hill_foe_seen"] == [[5, 5], [12, 12]], (
+        "Max 模式应保留全部历史坐标（包含幽灵敌丘）"
+    )
+    assert np.array_equal(planes.encode_memory(after_max, [rows, cols]), np.maximum(before_t, sources_t))
+
+
+def test_remember_mode_max_ablation():
+    """验证 mode='max' 严格维持集合单调并集行为，供 EXP-010 / EXP-012 消融实验使用。
+    断言无论视野如何变化，只要出现过的坐标均持续累加保留，且与 np.maximum 完全逐位等价。"""
+    rows, cols = 16, 16
+    b = planes.Board(rows, cols)
+
+    # 初始状态：记录过食物 (2, 2) 与敌丘 (4, 4)
+    state = {"food_seen": [[2, 2]], "hill_foe_seen": [[4, 4]]}
+
+    # 当前观测：蚂蚁在全图视野下，食物被采完（无食物），敌丘已摧毁（无丘），但新增食物 (7, 7)
+    obs = {
+        "size": [rows, cols],
+        "mine": [[0, 0]],
+        "foes": [],
+        "food": [[7, 7]],
+        "hills": [],
+        "water": {"rle": [0, rows * cols]},
+        "vis": {"rle": [1, rows * cols]},  # 全图可见 (Vt = 1)
+    }
+
+    before = planes.encode_memory(state, [rows, cols])
+    after_max = planes.remember(state, obs, mode="max")
+    after_max_encoded = planes.encode_memory(after_max, [rows, cols])
+
+    sources = planes.encode(obs)[:, list(planes.MEMORY_SOURCES)]
+    expected_max = np.maximum(before, sources)
+
+    # 严格断言 max 行为
+    assert np.array_equal(after_max_encoded, expected_max), "mode='max' 未能与 np.maximum 保持一致"
+    assert [2, 2] in after_max["food_seen"] and [7, 7] in after_max["food_seen"]
+    assert [4, 4] in after_max["hill_foe_seen"]
+
+    # 对比断言 where 行为必定产生差异（在全图可见下，已清空的点不应保留）
+    after_where = planes.remember(state, obs, mode="where")
+    assert after_where["food_seen"] == [[7, 7]], "where 模式在全图可见下应只保留当前可见食物"
+    assert after_where["hill_foe_seen"] == [], "where 模式在全图可见下应彻底清除被摧毁敌丘"
+    assert not np.array_equal(after_max_encoded, planes.encode_memory(after_where, [rows, cols]))
+
+
+def test_with_memory_graph_matches_numpy_where_and_max():
+    """无需外部 dumped 依赖，直接测试 nets.WithMemory 的 write 与 np.where/np.maximum 的逐位一致性。"""
+    torch = pytest.importorskip("torch")
+    from tb_baselines import nets
+    spec = {"arch": "trunk", "channels": 9, "blocks": 3, "dilate": True}
+    m_where = nets.build(spec, memory="where")
+    m_max = nets.build(spec, memory="max")
+    assert m_where.memory_kind == "where"
+    assert m_max.memory_kind == "max"
+
+    b = torch.randint(0, 2, (1, 7, 32, 32), dtype=torch.int8)
+    m = torch.randint(0, 2, (1, 2, 32, 32), dtype=torch.int8)
+    out_where = m_where.write(None, b, m, mode="where")
+    np_where = np.where(b[:, 6:7].numpy() != 0, b[:, [2, 5]].numpy(), m.numpy()).astype(np.int8)
+    assert np.array_equal(out_where.numpy(), np_where)
+
+    out_max = m_max.write(None, b, m, mode="max")
+    np_max = np.maximum(m.numpy(), b[:, [2, 5]].numpy()).astype(np.int8)
+    assert np.array_equal(out_max.numpy(), np_max)
 
 
 @pytest.fixture(scope="session")
@@ -324,9 +458,9 @@ def test_the_memory_adapter_hands_back_the_memory_it_is_given_and_zeros_without(
 
 
 def test_the_graphs_memory_update_matches_the_encoder(dumped):
-    """`nets.WithMemory` 将 `Max(memory_in, board[sources])` 写入为 `i8`；训练器的 `remember`
+    """`nets.WithMemory` 将 `Where(vis, board[sources], memory_in)` 写入为 `i8`；训练器的 `remember`
     必须为下一回合生成完全相同的特征面。Torch 是开发依赖项且 CI 并不安装，
-    因此 CI 依赖 `test_remember_is_the_max_the_graph_takes`；在执行模型导出前请运行本测试。"""
+    因此 CI 依赖 `test_remember_is_the_where_the_graph_takes`；在执行模型导出前请运行本测试。"""
     torch = pytest.importorskip("torch")
     from tb_baselines import nets
     net = nets.build({"arch": "trunk", "channels": 4, "blocks": 1}, memory=True).eval()

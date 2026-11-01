@@ -36,7 +36,7 @@ from pathlib import Path
 
 from .env import Env, orders_from_indices
 from .planes import MEMORY, remember
-from .teacher import Teacher
+from .teacher import CompoundTeacher, Teacher
 
 
 def collect(
@@ -48,14 +48,23 @@ def collect(
     seed: int = 1,
     maps: str | None = None,
     remembers: bool = False,
+    teacher: str = "default",
+    hill_lead: int = 6,
+    memory_mode: str = "where",
 ) -> dict:
     """持续运行对局直到写入 `seat_turns` 行数据，并汇报采集统计数据。
 
     指定 `remembers` 时，教师模型会读取每个座位的记忆（参见 `teacher.py` 中的*会记忆的教师*），
     因此标签会依赖于每行数据在 `m` 键下携带的状态，带记忆的模型也因此有了可供模仿学习的信号。
-    规格等级天梯本身的数据集在采集时不开启记忆。
     """
-    teacher = Teacher()
+    if teacher == "default":
+        teacher_agent = Teacher(hill_lead=hill_lead)
+        teacher_desc = f"deterministic potential field (hill_lead={hill_lead})"
+    elif teacher == "compound":
+        teacher_agent = CompoundTeacher(hill_lead=hill_lead)
+        teacher_desc = "compound situational policy"
+    else:
+        raise ValueError(f"unknown teacher: {teacher!r}; expected 'default' or 'compound'")
     out.parent.mkdir(parents=True, exist_ok=True)
 
     written = 0
@@ -79,8 +88,11 @@ def collect(
             "env_seed": seed,
             # 教师模型是关于观测数据的纯函数（若开启记忆，则也是前序回合的纯函数，前序回合同样由环境种子唯一决定），
             # 因此环境种子即构成了全部出处：基于该数值与引擎摘要即可完全确定性复现本数据集。
-            "teacher": "deterministic potential field" + (", remembering" if remembers else ""),
+            "teacher": teacher_desc + (", remembering" if remembers else ""),
+            "teacher_type": teacher,
             "teacher_remembers": remembers,
+            "hill_lead": hill_lead,
+            "memory_mode": memory_mode,
             # 每行数据在 `m` 键下携带的记忆状态，按特征平面名称列出。
             "memory": [m.name for m in MEMORY],
         }) + "\n")
@@ -96,7 +108,7 @@ def collect(
                 key = (s.ep, s.seat)
                 state = remembered.get(key)
                 row = {"o": s.obs, "k": [s.ep, s.seat, s.turn]}
-                moves = teacher.orders(s.obs, water, seen, state if remembers else None)
+                moves = teacher_agent.orders(s.obs, water, seen, state if remembers else None)
                 row["m"] = state or {}
                 order = orders_from_indices(moves, [len(s.obs["mine"])])[0]
                 actions.append(order)
@@ -107,7 +119,7 @@ def collect(
                     f.write(json.dumps(row, separators=(",", ":")) + "\n")
                     written += 1
                     ants += len(order)
-                remembered[key] = remember(state, s.obs)
+                remembered[key] = remember(state, s.obs, mode=memory_mode)
 
             step = env.step(actions)
             for e in step.ended:
@@ -129,6 +141,9 @@ def collect(
         "seconds": round(elapsed, 1),
         "rows_per_second": round(written / max(elapsed, 1e-9)),
         "bytes": out.stat().st_size,
+        "teacher": teacher,
+        "hill_lead": hill_lead,
+        "memory_mode": memory_mode,
     }
 
 
@@ -149,12 +164,19 @@ def main(argv: list[str] | None = None) -> None:
                     help="棋盘 ID、文件路径或包含棋盘的目录；默认为发布包中的基础棋盘")
     ap.add_argument("--remember", action="store_true",
                     help="教师模型读取每个座位的记忆，生成的训练标签将依赖于记忆状态")
+    ap.add_argument("--teacher", choices=["default", "compound"], default="default",
+                    help="教师模型策略类型：'default' 为势能场单一教师，'compound' 为条件化复合调度教师（默认 'default'）")
+    ap.add_argument("--hill-lead", type=int, default=6,
+                    help="敌方蚁丘相对食物的起步领先步数（默认 6，激进进攻设为 12）")
+    ap.add_argument("--memory-mode", choices=["where", "max"], default="where",
+                    help="记忆更新模式：'where' 为可见性校正条件选择更新，'max' 为历史单调并集累积更新（默认 'where'）")
     argv = sys.argv[1:] if argv is None else argv
     a = ap.parse_args(argv)
 
     stats = collect(
         a.out, a.seat_turns, waves=a.waves, matches_per_wave=a.matches_per_wave,
         max_turns=a.max_turns, seed=a.seed, maps=a.maps, remembers=a.remember,
+        teacher=a.teacher, hill_lead=a.hill_lead, memory_mode=a.memory_mode,
     )
     # 命令行记录在统计数字旁，以便导出脚本在模型卡片上直接打印生成该数据集的配方命令，而非指向 README。
     stats["command"] = shlex.join(["python", "-m", "tb_baselines.collect", *argv])

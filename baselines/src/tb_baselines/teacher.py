@@ -68,11 +68,18 @@ class Teacher:
     """每个进程维护一个实例即可；它在回合之间不保留任何状态，可安全复用。"""
 
     def __init__(self, hill_lead: int = 6, max_depth: int = 32):
+        if hill_lead < 0:
+            raise ValueError(f"hill_lead must be non-negative, got {hill_lead}")
+        if max_depth < 1:
+            raise ValueError(f"max_depth must be positive, got {max_depth}")
         self.hill_lead = hill_lead
         # 蚂蚁每次仅决策一步，因此距离目标 60 格与距离目标 30 格会导出完全相同的移动决策。
         # 因此为泛洪深度设定上限在对局质量上是零损失的，同时占据了绝大部分运行时间优化：
         # 若不设上限，前沿种子会使得纯 Python 循环在每个座位的每个回合遍历棋盘的几乎每一个单元格。
         self.max_depth = max_depth
+
+    def __repr__(self) -> str:
+        return f"Teacher(hill_lead={self.hill_lead}, max_depth={self.max_depth})"
 
     # ---- 势能场构建 ----------------------------------------------------------------
 
@@ -206,6 +213,302 @@ class Teacher:
                 taken.add((nr, nc))
             out[i] = best
         return out
+
+
+class CompoundTeacher:
+    """条件复合启发式教师：态势感知动态分工调度（IDEA-002 R2/EXP-014）。
+
+    每个进程维护一个实例即可；它在回合之间不保留内部状态，可安全复用。
+
+    ## 核心调度逻辑
+    1. **态势感知（Situational Awareness）**：
+       从公开观测 `obs["hills"]` 与座位记忆 `memory["hill_foe_seen"]` 中实时识别已探明且未被摧毁的敌方蚁丘。
+       已进入当前视野但上方无蚁穴的记忆坐标被判定为已被摧毁，自动过滤。
+    2. **动态兵工分工（Dynamic Squad Division）**：
+       - **阶段 A（全员觅食与探索）**：若未探明敌方蚁丘，或己方存活蚂蚁数不足 `min_raid_ants`（默认 4），
+         100% 兵力优先执行食物采集与未知前沿开拓，迅速建立初始经济人口基础。
+       - **阶段 B（动态突击与经济维持）**：一旦探明敌方蚁丘且存活蚂蚁达到阈值，动态划分：
+         - **突击分队（Raid Squad）**：距离敌方蚁丘最近的比例蚂蚁（由 `raid_ratio` 控制，默认 50%），直扑敌方蚁穴实施摧毁；
+         - **采食分队（Gather Squad）**：其余蚂蚁持续在后方采集食物，保障蚁巢源源不断产卵补充兵力。
+    3. **无碰撞仲裁（Collision-Free Arbitration）**：
+       维护统一共享的 `taken` 集合。突击分队具备行进绝对优先权率先决策并锁定占有格，
+       采食分队在剩余可行空间中决策。严格杜绝友军互撞、入水与撞食，输出完全确定性的动作标签。
+    """
+
+    def __init__(
+        self,
+        min_raid_ants: int = 4,
+        raid_ratio: float = 0.5,
+        max_depth: int = 32,
+        hill_lead: int = 6,
+    ):
+        if min_raid_ants < 1:
+            raise ValueError(f"min_raid_ants must be >= 1, got {min_raid_ants}")
+        if not (0.0 < raid_ratio <= 1.0):
+            raise ValueError(f"raid_ratio must be in (0.0, 1.0], got {raid_ratio}")
+        if max_depth < 1:
+            raise ValueError(f"max_depth must be >= 1, got {max_depth}")
+        if hill_lead < 0:
+            raise ValueError(f"hill_lead must be non-negative, got {hill_lead}")
+        self.min_raid_ants = min_raid_ants
+        self.raid_ratio = raid_ratio
+        self.max_depth = max_depth
+        self.hill_lead = hill_lead
+
+    def __repr__(self) -> str:
+        return (
+            f"CompoundTeacher(min_raid_ants={self.min_raid_ants}, "
+            f"raid_ratio={self.raid_ratio}, max_depth={self.max_depth}, "
+            f"hill_lead={self.hill_lead})"
+        )
+
+    # ---- 态势识别 ------------------------------------------------------------------
+
+    def _get_known_enemy_hills(
+        self,
+        obs: dict,
+        water: np.ndarray,
+        seen: np.ndarray,
+        memory: dict | None,
+    ) -> set[tuple[int, int]]:
+        """从当前观测与记忆中提取所有已知且未确认被摧毁的敌方蚁丘坐标。"""
+        rows, cols = obs["size"]
+        visible = seen & ~water
+        hills: set[tuple[int, int]] = set()
+
+        # 1. 当前观测中可见的敌方蚁丘（非 0 号观察者自己）
+        for r, c, owner in obs.get("hills", []):
+            if owner != 0:
+                hills.add((int(r), int(c)))
+
+        # 2. 记忆中记录的敌方蚁丘（仅保留尚未进入当前视野被确认消除的坐标）
+        if memory:
+            for r, c in memory.get("hill_foe_seen", ()):
+                r, c = int(r), int(c)
+                if 0 <= r < rows and 0 <= c < cols and not visible[r, c]:
+                    hills.add((r, c))
+
+        return hills
+
+    # ---- 势能场构建 ----------------------------------------------------------------
+
+    def field_gather(
+        self,
+        obs: dict,
+        water: np.ndarray,
+        seen: np.ndarray,
+        memory: dict | None,
+        fallback_hills: set[tuple[int, int]],
+    ) -> np.ndarray:
+        """采食与探索势能场：食物优先级最高，其次为未探索前沿，最后为备用敌丘。"""
+        rows, cols = obs["size"]
+        dist = np.full((rows, cols), FAR, dtype=np.int32)
+        passable = ~water
+        at_level: dict[int, np.ndarray] = {}
+
+        def seed(mask: np.ndarray, level: int) -> None:
+            if level in at_level:
+                at_level[level] |= mask
+            else:
+                at_level[level] = mask.copy()
+
+        # 1. 视野内的食物：起步领先 0 级（最高优先）
+        if obs.get("food"):
+            food = np.zeros((rows, cols), dtype=bool)
+            idx = np.asarray(obs["food"], dtype=np.int64)
+            food[idx[:, 0], idx[:, 1]] = True
+            seed(food & passable, 0)
+
+        # 2. 记忆中视野外的食物：第 1 级
+        if memory:
+            visible = seen & ~water
+            recalled = np.zeros((rows, cols), dtype=bool)
+            for r, c in memory.get("food_seen", ()):
+                r, c = int(r), int(c)
+                if 0 <= r < rows and 0 <= c < cols and not visible[r, c]:
+                    recalled[r, c] = True
+            if recalled.any():
+                seed(recalled & passable, 1)
+
+        # 3. 未知探索前沿：第 2 级
+        unseen = ~seen
+        if unseen.any():
+            seed(unseen & passable, 2)
+
+        # 4. 备用敌丘目标：当食物全被采光且全图探索完毕时，作为最低兜底引导
+        if fallback_hills:
+            fh = np.zeros((rows, cols), dtype=bool)
+            for r, c in fallback_hills:
+                fh[r, c] = True
+            seed(fh & passable, self.max_depth)
+
+        if not at_level:
+            return dist
+
+        wave = np.zeros((rows, cols), dtype=bool)
+        for depth in range(0, self.max_depth + 1):
+            step = at_level.pop(depth, None)
+            if wave.any():
+                spread = (
+                    np.roll(wave, 1, 0) | np.roll(wave, -1, 0)
+                    | np.roll(wave, 1, 1) | np.roll(wave, -1, 1)
+                )
+                step = spread if step is None else (spread | step)
+            if step is None:
+                continue
+            step &= passable & (dist == FAR)
+            if not step.any() and not at_level:
+                break
+            dist[step] = depth
+            wave = step
+        return dist
+
+    def field_raid(
+        self,
+        obs: dict,
+        water: np.ndarray,
+        enemy_hills: set[tuple[int, int]],
+    ) -> np.ndarray:
+        """突击分队专用势能场：以已知敌方蚁丘为唯一初始源点向全图扩散。"""
+        rows, cols = obs["size"]
+        dist = np.full((rows, cols), FAR, dtype=np.int32)
+        if not enemy_hills:
+            return dist
+
+        passable = ~water
+        hills = np.zeros((rows, cols), dtype=bool)
+        for r, c in enemy_hills:
+            hills[r, c] = True
+
+        step = hills & passable
+        dist[step] = 0
+        wave = step
+        max_d = max(self.max_depth, rows + cols)
+        for depth in range(1, max_d + 1):
+            if not wave.any():
+                break
+            spread = (
+                np.roll(wave, 1, 0) | np.roll(wave, -1, 0)
+                | np.roll(wave, 1, 1) | np.roll(wave, -1, 1)
+            )
+            step = spread & passable & (dist == FAR)
+            if not step.any():
+                break
+            dist[step] = depth
+            wave = step
+        return dist
+
+    # ---- 动作决策与无冲突仲裁 ------------------------------------------------------
+
+    def orders(
+        self,
+        obs: dict,
+        water: np.ndarray,
+        seen: np.ndarray,
+        memory: dict | None = None,
+    ) -> np.ndarray:
+        """输出每只蚂蚁的移动动作索引，严格与 `obs['mine']` 顺序对应。"""
+        mine = obs["mine"]
+        if not mine:
+            return np.zeros(0, dtype=np.int64)
+
+        rows, cols = obs["size"]
+        total_ants = len(mine)
+        enemy_hills = self._get_known_enemy_hills(obs, water, seen, memory)
+
+        # 食物阻挡移动（turn.rs:77-85），标记阻挡单元格
+        blocked = np.zeros((rows, cols), dtype=bool)
+        for r, c in obs.get("food", []):
+            blocked[r, c] = True
+
+        taken = {tuple(a) for a in mine}
+        out = np.full(total_ants, HOLD, dtype=np.int64)
+
+        gather_dist = self.field_gather(obs, water, seen, memory, enemy_hills)
+
+        # 判定是否进入阶段 B
+        is_phase_b = (len(enemy_hills) > 0) and (total_ants >= self.min_raid_ants)
+
+        if not is_phase_b:
+            # 阶段 A：全员采食与探索
+            order = sorted(range(total_ants), key=lambda i: (gather_dist[mine[i][0], mine[i][1]], i))
+            for i in order:
+                ar, ac = mine[i]
+                best, best_d = HOLD, gather_dist[ar, ac]
+                for k in range(4):
+                    dr, dc = DELTAS[k]
+                    nr, nc = (ar + dr) % rows, (ac + dc) % cols
+                    if water[nr, nc] or blocked[nr, nc] or (nr, nc) in taken:
+                        continue
+                    if gather_dist[nr, nc] < best_d:
+                        best, best_d = k, gather_dist[nr, nc]
+                if best != HOLD:
+                    dr, dc = DELTAS[best]
+                    nr, nc = (ar + dr) % rows, (ac + dc) % cols
+                    taken.discard((ar, ac))
+                    taken.add((nr, nc))
+                out[i] = best
+            return out
+
+        # 阶段 B：动态兵工分工
+        raid_dist = self.field_raid(obs, water, enemy_hills)
+        num_raid = max(1, min(total_ants - 1, int(round(total_ants * self.raid_ratio))))
+
+        # 按到最近敌丘的距离升序排序，确定突击分队成员
+        sorted_by_hill = sorted(range(total_ants), key=lambda i: (raid_dist[mine[i][0], mine[i][1]], i))
+        raid_indices = sorted_by_hill[:num_raid]
+        gather_indices = sorted_by_hill[num_raid:]
+
+        # 第一优先级：突击分队率先移动（沿 raid_dist 势场）
+        for i in raid_indices:
+            ar, ac = mine[i]
+            cur_d = raid_dist[ar, ac]
+            # 若因水域完全隔断导致敌丘不可达，无缝平滑回退至采食势场
+            dist_field = raid_dist if cur_d < FAR else gather_dist
+            best, best_d = HOLD, dist_field[ar, ac]
+
+            for k in range(4):
+                dr, dc = DELTAS[k]
+                nr, nc = (ar + dr) % rows, (ac + dc) % cols
+                if water[nr, nc] or blocked[nr, nc] or (nr, nc) in taken:
+                    continue
+                if dist_field[nr, nc] < best_d:
+                    best, best_d = k, dist_field[nr, nc]
+
+            if best != HOLD:
+                dr, dc = DELTAS[best]
+                nr, nc = (ar + dr) % rows, (ac + dc) % cols
+                taken.discard((ar, ac))
+                taken.add((nr, nc))
+            out[i] = best
+
+        # 第二优先级：采食分队在剩余可用方格中移动（沿 gather_dist 势场）
+        gather_order = sorted(gather_indices, key=lambda j: (gather_dist[mine[j][0], mine[j][1]], j))
+        for j in gather_order:
+            ar, ac = mine[j]
+            best, best_d = HOLD, gather_dist[ar, ac]
+
+            for k in range(4):
+                dr, dc = DELTAS[k]
+                nr, nc = (ar + dr) % rows, (ac + dc) % cols
+                if water[nr, nc] or blocked[nr, nc] or (nr, nc) in taken:
+                    continue
+                if gather_dist[nr, nc] < best_d:
+                    best, best_d = k, gather_dist[nr, nc]
+
+            if best != HOLD:
+                dr, dc = DELTAS[best]
+                nr, nc = (ar + dr) % rows, (ac + dc) % cols
+                taken.discard((ar, ac))
+                taken.add((nr, nc))
+            out[j] = best
+
+        return out
+
+    def act(self, obs: dict, memory: dict | None = None) -> list[int]:
+        """对弈模型标准接口：接收 obs 与可选 memory，返回动作列表。"""
+        water, seen = known(obs)
+        return self.orders(obs, water, seen, memory).tolist()
 
 
 def known(obs: dict) -> tuple[np.ndarray, np.ndarray]:
