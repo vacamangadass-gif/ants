@@ -23,3 +23,7 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-p no:launch_testing -p no:launch_ros"
+cache_dir = "/tmp/.pytest_cache"
+

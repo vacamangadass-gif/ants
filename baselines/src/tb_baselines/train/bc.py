@@ -33,9 +33,12 @@
 ## `--memory` 参数
 
 启用 `--memory` 时，网络结构为 `nets.WithMemory`：它在读取棋盘特征的同时读取座位的记忆面（`planes.MEMORY`，
-通过 `Max` 保留的两个特征面），并将更新后的记忆写回。记忆是当前行之前各回合的确定性函数，
-因此训练循环保持不变：`collect.py` 在每行数据的 `m` 键下记录座位当时记住的内容，`tensors` 通过 `planes.encode_memory`
-将其渲染为张量。由于教师不读取记忆，标签并不依赖于记忆，记忆模型蒸馏的依然是同一个寻食策略；
+通过 `Where` 条件更新算子保留的两个特征面：视野可见单元格更新为当前观测值清除幽灵敌丘，迷雾区域保留历史记忆），
+并将更新后的记忆写回。在 micro 等级（`--class micro --memory`）下，模型具有 28 通道、3 块空洞卷积（膨胀率 [1, 2, 4, 8]，
+单向感知距离 15 格，感受野 31x31）、9 个输入平面（7 板面 + 2 记忆面）以及严格 24,505 个物理参数（无记忆时为 24,001 个）。
+记忆是当前行之前各回合的确定性函数，因此训练循环保持不变：`collect.py` 在每行数据的 `m` 键下记录座位当时记住的内容，
+`tensors` 通过 `planes.encode_memory` 将其渲染为张量。
+由于教师已在生成轨迹时读取并维护记忆（`teacher_remembers: true`），模型能够端到端学习依赖记忆的战术决策；
 此训练运行验证的是带记忆模型贯穿准入校验、时序承接与 `conform` 一致性测试的整套链路。
 """
 
@@ -202,7 +205,8 @@ def override(spec: dict, args) -> dict:
 
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--class", dest="cls", required=True)
+    ap.add_argument("--class", dest="cls", required=True,
+                    help="规格等级名称，如 nano, micro 等（见 classes.toml）")
     # 变体是命令行参数，而非第二张静态表：运行的 history.json 与模型卡片都会记录实际构建的内容，这才是关键记录。
     ap.add_argument("--arch", default=None, help="覆盖该规格的默认网络架构")
     ap.add_argument("--channels", type=int, default=None)
