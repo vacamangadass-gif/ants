@@ -215,3 +215,53 @@ python3 tools/equivalence.py <旧发布解压路径> dist --allow ids
    提交信息使用完整的陈述句（平台语气，如 `"Enforce strict torus wrapping distance calculation"`），不使用 conventional-commit（如 `feat:` / `fix:`）前缀。
 5. **注释与解释性**：
    编写代码注释时注重解释**为什么**（说明被否决的替代方案、所防范的潜在 Bug、对应的竞赛规则行号），而不是简单复述代码在做什么。
+
+---
+
+## 7. 研究分支谱系与 Pull Request 工作流规范（Branch Topology & PR Workflow）
+
+### 7.1 历史研究分支谱系归档
+
+仓库历史研究分支均已固化并在远端留存，其谱系演化关系如下：
+
+1. **`idea/002-compound-teacher-memory`（阶段一：记忆修正与复合教师）**：
+   - **检出起点**：从初始阶段提交 `daf5c30` 检出；
+   - **核心提交**：`51ea23f`（`Implement visibility-corrected memory with Where operator, compound teacher dispatch, and empirical ablation suites for IDEA-002`）；
+   - **验证目标**：实现了 Where 条件记忆算子与 `CompoundTeacher` 动态分工调度逻辑。
+2. **`idea/002-capacity-scaling`（阶段二：网络容量扩展）**：
+   - **检出起点**：承接 `idea/002-compound-teacher-memory` 的 `51ea23f` 提交；
+   - **核心提交序列**：
+     - `ab1d703`：扩展学生网络容量至 Micro 规格，并完成 504 场双向循环赛评测；
+     - `619cb86`、`9168990`、`62bff6f`：沉淀 EXP-011、EXP-012、EXP-022 技术文档；
+   - **成果归档**：成果已快进同步合入主分支。
+3. **`idea/006-dagger-aggregation`（阶段三：数据集聚合）**：
+   - **检出起点**：从 `62bff6f` 检出；
+   - **核心提交序列**：
+     - `ac18232`：构建 DAgger 交互推演闭环，验证 500k 样本预算下的状态分布修复；
+     - `6f55f21`：增加可视化图表生成工具与绘图规范；
+     - `85a7034`：双轨 8 轮 DAgger 完整聚合（91.6 万样本）、16 模型大循环赛及 Kneedle 拐点分析；
+   - **成果归档**：成果已快进同步合入主分支，并在远端独立保留完整提交历史。
+
+### 7.2 后续研究分支强制规范
+
+自 IDEA-006 之后的所有后续实验分支（如感受野扩展、信息素扩散、PPO 自博弈等），必须严格遵守以下工作流，禁止直接向 `master` 分支推送提交：
+
+1. **分支命名与创建**：
+   从最新的 `master` 检出独立子分支，命名规范统一为 `idea/<number>-<topic>`：
+   ```sh
+   git checkout -b idea/<number>-<topic> master
+   ```
+2. **分支独立推演与验证**：
+   所有代码修改、训练运行、评测生成与文档记录均在该独立分支上进行并提交。
+3. **推送远端与创建 Pull Request**：
+   完成本地验证后推送到远程仓库，并直接使用 GitHub CLI 工具创建 PR：
+   ```sh
+   git push -u origin idea/<number>-<topic>
+   gh pr create --base master --head idea/<number>-<topic> --title "<清晰的英语陈述句标题>" --body "<实验内容与结果说明>"
+   ```
+4. **审查与合并生效**：
+   确认检查通过后，通过 GitHub CLI 执行合并：
+   ```sh
+   gh pr merge idea/<number>-<topic> --merge --delete-branch
+   ```
+
