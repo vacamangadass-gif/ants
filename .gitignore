@@ -11,3 +11,5 @@ data/
 runs/
 models/
 replays/
+__pycache__/
+*.py[cod]

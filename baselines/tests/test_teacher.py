@@ -30,7 +30,8 @@ def test_a_remembered_enemy_hill_out_of_sight_is_the_nearest_target():
     water, seen = known(obs)
     plain = t.field(obs, water, seen)
     remembering = t.field(obs, water, seen, {"hill_foe_seen": [[0, 12]], "food_seen": []})
-    assert plain[0, 12] == t.hill_lead + 2, "未被看见，因此具有探索前沿的等级"
+    assert plain[4, 12] == t.hill_lead + 2, "探索前沿边界单元格具有标准前沿等级"
+    assert plain[0, 12] == t.hill_lead + 2 + 4, "迷雾内部单元格按测地距离递增"
     assert remembering[0, 12] == 0, "敌方蚁穴一旦被发现即作为攻击目标，直到亲眼确认其被摧毁"
     assert remembering[12, 12] < plain[12, 12], "蚂蚁所在位置因此距离目标更近"
 
@@ -51,9 +52,10 @@ def test_remembered_food_out_of_sight_sits_between_food_in_view_and_the_frontier
     obs = board(food=[(12, 14)])
     water, seen = known(obs)
     f = t.field(obs, water, seen, {"hill_foe_seen": [], "food_seen": [[0, 12], [12, 14]]})
-    assert f[12, 14] == t.hill_lead, "视野内的食物保持其优先级等级"
-    assert f[0, 12] == t.hill_lead + 1, "视野外记住的食物优先级落后其一级"
-    assert t.field(obs, water, seen)[0, 12] == t.hill_lead + 2, "探索前沿则再落后一级"
+    assert f[12, 13] == t.hill_lead, "视野内的食物合法采集位保持其优先级等级"
+    assert f[12, 14] == FAR, "食物实体单元格自身为不可通行物理阻挡"
+    assert f[1, 12] == t.hill_lead + 1, "视野外记住的食物合法采集位优先级落后其一级"
+    assert t.field(obs, water, seen)[4, 12] == t.hill_lead + 2, "探索前沿边界则再落后一级"
 
 
 def test_without_a_memory_the_remembering_teacher_is_the_plain_one():
@@ -112,23 +114,24 @@ def test_compound_teacher_dynamic_squad_switching():
     """
     ct = CompoundTeacher(min_raid_ants=4, raid_ratio=0.5)
 
-    # Case 2a: 6 只蚂蚁，无敌丘
+    # Case 2a: 6 只蚂蚁，无敌丘，提供 6 份食物确保全员执行采食任务
     ants_6 = [(10, 10), (10, 11), (11, 10), (11, 11), (12, 10), (12, 11)]
-    obs_2a = make_board(size=24, ants=ants_6, hills=[], food=[(12, 14)])
+    foods_6 = [(10, 14), (10, 15), (11, 14), (11, 15), (12, 14), (12, 15)]
+    obs_2a = make_board(size=24, ants=ants_6, hills=[], food=foods_6)
     w_2a, s_2a = known(obs_2a)
     orders_2a = ct.orders(obs_2a, w_2a, s_2a)
     default_2a = Teacher(hill_lead=6).orders(obs_2a, w_2a, s_2a)
-    assert np.array_equal(orders_2a, default_2a), "无已知敌丘时，应处于 Phase A 全员采食探索"
+    assert np.array_equal(orders_2a, default_2a), "无已知敌丘时，应处于 Phase A 全员采食"
 
     # Case 2b: 2 只蚂蚁，有已知敌丘与更远处的食物。传统 Teacher 因起步领先优势会孤军突击敌丘 (0)；
     # 但 CompoundTeacher 因兵力不足 min_raid_ants (4)，留在 Phase A 全员向东 (1) 采食积累经济。
-    obs_2b = make_board(size=24, ants=[(12, 12), (12, 13)], hills=[(5, 12, 1)], food=[(12, 15)])
+    obs_2b = make_board(size=24, ants=[(12, 12), (12, 13)], hills=[(5, 12, 1)], food=[(12, 15), (13, 15)])
     w_2b, s_2b = known(obs_2b)
     orders_2b = ct.orders(obs_2b, w_2b, s_2b)
     assert (orders_2b == 1).all(), "兵力不足 min_raid_ants 时，应处于 Phase A 不贸然进攻"
 
-    # Case 2c: 6 只蚂蚁，有已知敌丘 (5, 10) 与食物 (12, 14)
-    obs_2c = make_board(size=24, ants=ants_6, hills=[(5, 10, 1)], food=[(12, 14)])
+    # Case 2c: 6 只蚂蚁，有已知敌丘 (5, 10) 与食物。提供 3 份食物供给采食分队
+    obs_2c = make_board(size=24, ants=ants_6, hills=[(5, 10, 1)], food=[(12, 14), (11, 14), (10, 14)])
     w_2c, s_2c = known(obs_2c)
     orders_2c = ct.orders(obs_2c, w_2c, s_2c)
     # 距离敌丘最近的 3 只蚂蚁编入突击队向北 (0)，其余 3 只蚂蚁编入采食队向东 (1)
