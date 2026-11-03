@@ -692,6 +692,10 @@ def main(argv: list[str] | None = None) -> None:
 
     parts: list[Path] = [a.base_data]
     current_weights: Path = a.base_weights
+    if not current_weights.exists():
+        repo_root = Path(__file__).resolve().parents[3]
+        if (repo_root / current_weights).exists():
+            current_weights = repo_root / current_weights
 
     print(f"=== Starting DAgger Pipeline ({a.iterations} iterations) ===")
     print(f"Base data: {a.base_data}")

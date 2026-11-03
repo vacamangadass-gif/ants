@@ -1,61 +1,20 @@
-"""脚本启发式教师模型：全图势能场引导，每回合运行一次广度优先搜索（BFS）。
-
-**它不是基准模型，绝不能作为参赛基准交付。** 它是一个*标注数据源（Label Source）*。规格等级天梯的全部意义在于：
-固定同一个教师模型，并探究将其压缩至 8 KiB、64 KiB、512 KiB 时能保留多少能力 —— 这个问题唯有在每个等级的教师模型完全一致，
-且该教师是一个规则智能体而非另一个神经网络时才具有科学意义。蒸馏启发式算法也是让天梯具备可对弈基线的最高效、诚实的方式；
-未训练的静态桩代码原地不动，教不会任何人任何东西。
-
-它是一个*对弈选手*，而不是第二套游戏引擎。它读取游戏协议定义的公开观测数据，并输出行动指令 —— 与选手的模型完全一致。
-它不实现任何游戏规则：它从不裁决谁阵亡、蚁穴值多少分，或比赛何时结束。`ants/CLAUDE.md` 中的禁令禁止的是重复实现*游戏规则*，
-而本模块没有任何规则逻辑。
-
-## 它的对战机制
-
-每个回合执行一次多源 BFS，在当前座位已知非水域的单元格上，同时从所有目标点出发扩散：食物、敌方蚁穴以及从未探索过的未知前沿。
-每只蚂蚁随后沿着生成的距离势能场顺流而下。这是最经典的 Ants 开局智能体实现，且刻意保持平庸普通 ——
-此处有趣的研究课题是神经网络能从中学到多少，而非该启发式算法本身有多强。
-
-三项关键调优，每一项都旨在改变生成的对局质量而非改变智能体风格：
-
-* **目标通过“起步领先（head start）”加权**，而非通过乘法系数加权。食物以距离 0 加入队列，敌方蚁穴以 `-hill_lead` 加入队列，
-  因此蚁穴在相差该步数范围内具有更高优先级。在距离场上使用乘法系数会破坏 BFS 的单调性，那是此类实现的常见 Bug。
-* **任意两只蚂蚁绝不抢占同一个方格**。否则它们都会阵亡（参见 `ants/engine/src/turn.rs`：停留在共享方格上的所有蚂蚁全部死亡，包括己方），
-  那是损失整个蚁群最愚蠢的方式。
-* **全程绝无任何随机性**。给定随机种子和游戏引擎，教师模型是关于观测数据的纯函数，这并非单纯的代码洁癖 ——
-  这是使其完全可被模仿学习的前提保证。详见下文。
-
-## 确定性是刚性要求，而非锦上添花
-
-本模块的初始版本在决策前打乱了四个移动方向，以消除方向偏好并打破并列平局，且随机指派四分之一的蚂蚁进行盲目侦察。
-这两项改动看似无害实则极具破坏性：在 116 万次决策实测中，标签分布呈现为 **W 25.6% / E 25.3% / S 24.3% / N 23.8% / 原地 1.0%** ——
-几乎完全均匀分布，因为在开阔地形中，四个相邻单元格通常有两个与远方目标距离相同，此时的决策沦为抛硬币。
-
-非状态函数的不可预测标签是无法被网络学习的。模仿学习的准确率存在一个上限，大致对应于非抛硬币决策的比例，再大的模型容量也无法突破该上限 ——
-因此基于此类数据集构建的规格等级天梯，衡量的将是教师模型的噪声底噪，而非各等级的网络容量。
-
-因此，平局按固定的方向顺序打破，且彻底废弃了随机侦察：探索前沿已经作为种子注入泛洪场中，因此当蚂蚁无处可去时，
-它会走向未探索区域，*因为势能场正是这样指引的*。在真正平局时引入方向偏好是真实存在的，但这是完全正确的权衡 ——
-它是确定性的，因此神经网络能够精准拟合它。
-
-## 会记忆的教师（A teacher that remembers）
-
-给定座位的记忆（`planes.MEMORY`，曾经出现过食物和敌方蚁穴的单元格，如 `collect.py` 在 `m` 键下携带的内容），
-`orders` 会读取它，生成的训练标签也因此依赖于记忆：
-
-* **见过一次的敌方蚁穴始终是目标，直到有蚂蚁走到该方格并确认其已被摧毁。** 普通教师模型在没有蚂蚁靠近蚁穴的回合会立即遗忘并四处游荡；
-  而会记忆的教师会持续朝该目标行进。这是记忆在本作中的核心意义所在：摧毁蚁穴价值 2 分，且通常在离它很远时就已经被发现了。
-* **视野之外曾经见过的食物是较弱的目标。** 食物在固定位置刷新（`ants/engine/src/food.rs` 循环对称集合），因此曾经出现过食物的单元格
-  未来依然会刷新。它的种子优先级比视野内的食物低一级，比未知前沿高一级；若蚂蚁视野内能看到该单元格为空，则会跳过该点。
-
-在不传入记忆时，它的动作与普通教师完全一致，步步吻合。两套逻辑合为一体，使得等级天梯保持其基准教师不变，
-而记忆变体能够获得可通过记忆提升的更优标签：读取 `memory_in` 的模型有信号可学，不读取的模型则能够量化遗忘的代价。
-"""
-
 from __future__ import annotations
+from enum import Enum
 
 import numpy as np
 
 from .planes import MOVES
+from .telemetry import (
+    FieldMetadata,
+    RejectionCode,
+    SOURCE_FOOD_MEMORY,
+    SOURCE_FOOD_VISIBLE,
+    SOURCE_FRONTIER_UNSEEN,
+    SOURCE_HILL_FOE,
+    SOURCE_NONE,
+    TelemetryRecord,
+    evaluate_ant_telemetry,
+)
 
 # 行优先偏移量，顺序与 `MOVES` 完全一致，因此索引可直接对应。
 DELTAS = ((-1, 0), (0, 1), (1, 0), (0, -1))
@@ -64,189 +23,1035 @@ HOLD = MOVES.index("-")
 FAR = np.int32(1 << 29)
 
 
+class TaskState(Enum):
+    GATHER = "gather"
+    EXPLORE = "explore"
+    ASSAULT = "assault"
+    FORTIFY = "fortify"
+
+
+
+def extract_food_gathering_points(
+    food_coords: list[tuple[int, int]] | list[list[int]] | set[tuple[int, int]] | np.ndarray | None,
+    water_mask: np.ndarray,
+    rows: int,
+    cols: int,
+) -> np.ndarray:
+    """提取当前可见食物的正交相邻合法采集位集合 G_food (EXP-071A)。"""
+    if food_coords is None or len(food_coords) == 0:
+        return np.zeros((rows, cols), dtype=bool)
+
+    food_mask = np.zeros((rows, cols), dtype=bool)
+    if isinstance(food_coords, np.ndarray) and food_coords.size > 0:
+        food_mask[food_coords[:, 0], food_coords[:, 1]] = True
+    else:
+        for item in food_coords:
+            r, c = int(item[0]), int(item[1])
+            if 0 <= r < rows and 0 <= c < cols:
+                food_mask[r, c] = True
+
+    if not food_mask.any():
+        return np.zeros((rows, cols), dtype=bool)
+
+    neighbors = (
+        np.roll(food_mask, 1, 0)
+        | np.roll(food_mask, -1, 0)
+        | np.roll(food_mask, 1, 1)
+        | np.roll(food_mask, -1, 1)
+    )
+    passable = (~water_mask) & (~food_mask)
+    return neighbors & passable
+
+
+def extract_memory_food_gathering_points(
+    memory_food_coords: list[list[int]] | list[tuple[int, int]] | set[tuple[int, int]] | np.ndarray | None,
+    water_mask: np.ndarray,
+    visible_food_mask: np.ndarray,
+    g_food: np.ndarray,
+    rows: int,
+    cols: int,
+) -> np.ndarray:
+    """提取历史记忆食物的合法采集位集合 G_food_memory (EXP-071B)。"""
+    if memory_food_coords is None or len(memory_food_coords) == 0:
+        return np.zeros((rows, cols), dtype=bool)
+
+    mem_mask = np.zeros((rows, cols), dtype=bool)
+    if isinstance(memory_food_coords, np.ndarray) and memory_food_coords.size > 0:
+        for r, c in memory_food_coords:
+            r, c = int(r), int(c)
+            if 0 <= r < rows and 0 <= c < cols:
+                if not visible_food_mask[r, c] and not water_mask[r, c]:
+                    mem_mask[r, c] = True
+    else:
+        for item in memory_food_coords:
+            r, c = int(item[0]), int(item[1])
+            if 0 <= r < rows and 0 <= c < cols:
+                if not visible_food_mask[r, c] and not water_mask[r, c]:
+                    mem_mask[r, c] = True
+
+    if not mem_mask.any():
+        return np.zeros((rows, cols), dtype=bool)
+
+    neighbors = (
+        np.roll(mem_mask, 1, 0)
+        | np.roll(mem_mask, -1, 0)
+        | np.roll(mem_mask, 1, 1)
+        | np.roll(mem_mask, -1, 1)
+    )
+    passable = (~water_mask) & (~visible_food_mask)
+    return neighbors & passable & (~g_food)
+
+
+def extract_exploration_frontier(
+    seen_mask: np.ndarray,
+    water_mask: np.ndarray,
+    rows: int,
+    cols: int,
+    food_mask: np.ndarray | None = None,
+) -> np.ndarray:
+    """提取战争迷雾探索前沿集合 G_frontier (EXP-073B)。
+
+    严格限定在已知通行陆地：seen_mask & (~water_mask) & (~food_mask)，
+    且在环面四邻域中至少邻接一个未知迷雾单元格。
+    """
+    seen = np.asarray(seen_mask, dtype=bool)
+    water = np.asarray(water_mask, dtype=bool)
+    unseen = ~seen
+    adjacent_to_fog = (
+        np.roll(unseen, 1, 0)
+        | np.roll(unseen, -1, 0)
+        | np.roll(unseen, 1, 1)
+        | np.roll(unseen, -1, 1)
+    )
+    passable_known = seen & (~water)
+    if food_mask is not None:
+        food = np.asarray(food_mask, dtype=bool)
+        passable_known = passable_known & (~food)
+    return adjacent_to_fog & passable_known
+
+
+def compute_geodesic_potential_field(
+    sources: np.ndarray | list[tuple[int, int]] | set[tuple[int, int]] | dict[int, np.ndarray] | None,
+    passable_mask: np.ndarray,
+    rows: int,
+    cols: int,
+    max_depth: int | None = None,
+    return_meta: bool = False,
+    source_grid: np.ndarray | None = None,
+    initial_source_type: int = SOURCE_NONE,
+) -> np.ndarray | tuple[np.ndarray, FieldMetadata]:
+    """计算环面网格上的最短测地距离场与遥测元数据 (EXP-073A)。
+
+    采用向量化广度优先搜索扩散，支持自然波前队列耗尽。
+    """
+    dist = np.full((rows, cols), FAR, dtype=np.int32)
+    if source_grid is None:
+        source_grid = np.zeros((rows, cols), dtype=np.int32)
+
+    at_level: dict[int, np.ndarray] = {}
+
+    if isinstance(sources, dict):
+        for lvl, mask in sources.items():
+            lvl_int = int(lvl)
+            mask_bool = np.asarray(mask, dtype=bool)
+            if lvl_int in at_level:
+                at_level[lvl_int] = at_level[lvl_int] | mask_bool
+            else:
+                at_level[lvl_int] = mask_bool.copy()
+    elif sources is not None:
+        init_mask = np.zeros((rows, cols), dtype=bool)
+        if isinstance(sources, np.ndarray) and sources.dtype == bool and sources.shape == (rows, cols):
+            init_mask = sources.copy()
+        elif isinstance(sources, np.ndarray) and sources.ndim == 2 and sources.shape[1] == 2:
+            if sources.size > 0:
+                for r, c in sources:
+                    r_i, c_i = int(r), int(c)
+                    if 0 <= r_i < rows and 0 <= c_i < cols:
+                        init_mask[r_i, c_i] = True
+        else:
+            for item in sources:
+                r_i, c_i = int(item[0]), int(item[1])
+                if 0 <= r_i < rows and 0 <= c_i < cols:
+                    init_mask[r_i, c_i] = True
+
+        if init_mask.any():
+            at_level[0] = init_mask
+
+    if initial_source_type != SOURCE_NONE and 0 in at_level:
+        valid_src = at_level[0] & passable_mask
+        source_grid[valid_src & (source_grid == SOURCE_NONE)] = initial_source_type
+
+    if not at_level:
+        if return_meta:
+            meta = FieldMetadata(
+                frontier_size=0,
+                frontier_nonempty_at_limit=False,
+                source_grid=source_grid,
+            )
+            return dist, meta
+        return dist
+
+    wave = np.zeros((rows, cols), dtype=bool)
+    exhausted_early = False
+    current_depth = 0
+    min_lvl = min(at_level.keys())
+    if min_lvl > 0:
+        current_depth = min_lvl
+
+    while wave.any() or at_level:
+        if max_depth is not None and current_depth > max_depth:
+            break
+
+        step = at_level.pop(current_depth, None)
+        if wave.any():
+            spread = (
+                np.roll(wave, 1, 0)
+                | np.roll(wave, -1, 0)
+                | np.roll(wave, 1, 1)
+                | np.roll(wave, -1, 1)
+            )
+            step = spread if step is None else (spread | step)
+
+        if step is None:
+            if at_level:
+                current_depth = min(at_level.keys())
+                continue
+            break
+
+        step &= passable_mask & (dist == FAR)
+        if not step.any():
+            if not at_level:
+                exhausted_early = True
+                break
+            wave = np.zeros((rows, cols), dtype=bool)
+            if at_level:
+                current_depth = min(at_level.keys())
+            continue
+
+        dist[step] = current_depth
+
+        if return_meta and wave.any():
+            spread_source = np.maximum.reduce([
+                np.roll(source_grid, 1, 0),
+                np.roll(source_grid, -1, 0),
+                np.roll(source_grid, 1, 1),
+                np.roll(source_grid, -1, 1),
+            ])
+            mask_to_update = step & (source_grid == SOURCE_NONE)
+            source_grid[mask_to_update] = spread_source[mask_to_update]
+
+        wave = step
+        current_depth += 1
+
+    if return_meta:
+        if exhausted_early or not wave.any():
+            frontier_size = 0
+            frontier_nonempty_at_limit = False
+        else:
+            frontier_size = int(np.count_nonzero(wave))
+            frontier_nonempty_at_limit = bool(frontier_size > 0 or bool(at_level))
+        meta = FieldMetadata(
+            frontier_size=frontier_size,
+            frontier_nonempty_at_limit=frontier_nonempty_at_limit,
+            source_grid=source_grid,
+        )
+        return dist, meta
+    return dist
+
+
+def arbitrate_orders(
+    mine_coords: list[list[int]] | list[tuple[int, int]] | np.ndarray,
+    candidate_sequences: list[list[int]],
+    potentials: list[int] | np.ndarray,
+    stall_counters: dict[int, int] | None = None,
+    fair_mode: bool = True,
+    rows: int = 0,
+    cols: int = 0,
+    return_iteration_count: bool = False,
+    ids: list[int] | None = None,
+    squad_tiers: list[int] | None = None,
+    rejections_out: dict[int, dict[int, str]] | list[dict[int, str]] | None = None,
+) -> tuple[np.ndarray, dict[int, int]] | tuple[np.ndarray, dict[int, int], int]:
+    """终点冲突仲裁与调度公平性核心算法（EXP-072A 与 EXP-072B）。"""
+    total_ants = len(mine_coords)
+    if total_ants == 0:
+        empty_orders = np.zeros(0, dtype=np.int64)
+        empty_stalls: dict[int, int] = {}
+        if return_iteration_count:
+            return empty_orders, empty_stalls, 0
+        return empty_orders, empty_stalls
+
+    mine_list: list[tuple[int, int]] = [
+        (int(m[0]), int(m[1])) for m in mine_coords
+    ]
+
+    if rows <= 0 or cols <= 0:
+        max_r = max(m[0] for m in mine_list)
+        max_c = max(m[1] for m in mine_list)
+        rows = max(rows, max_r + 1)
+        cols = max(cols, max_c + 1)
+
+    if ids is None:
+        ant_ids = list(range(total_ants))
+    else:
+        ant_ids = [int(x) for x in ids]
+
+    live_ids = set(ant_ids)
+    if stall_counters is not None:
+        current_stalls = {
+            int(k): int(v) for k, v in stall_counters.items() if int(k) in live_ids
+        }
+    else:
+        current_stalls = {}
+    for aid in ant_ids:
+        if aid not in current_stalls:
+            current_stalls[aid] = 0
+
+    pointers = [0] * total_ants
+
+    def get_dest(ant_idx: int, action: int) -> tuple[int, int]:
+        if action == HOLD:
+            return mine_list[ant_idx]
+        dr, dc = DELTAS[action]
+        return ((mine_list[ant_idx][0] + dr) % rows, (mine_list[ant_idx][1] + dc) % cols)
+
+    def get_priority(i: int) -> tuple:
+        aid = ant_ids[i]
+        pot = int(potentials[i])
+        tier = squad_tiers[i] if squad_tiers is not None else 0
+        stall = current_stalls.get(aid, 0)
+        if fair_mode:
+            if squad_tiers is not None:
+                return (tier, -stall, pot, aid)
+            return (-stall, pot, aid)
+        else:
+            if squad_tiers is not None:
+                return (tier, pot, aid)
+            return (pot, aid)
+
+    max_rounds = 4 * total_ants + 1
+    iteration_count = 0
+
+    while True:
+        iteration_count += 1
+        if iteration_count > max_rounds:
+            raise RuntimeError(
+                f"仲裁算法迭代轮次超过理论上限 4N: {iteration_count} > {max_rounds}"
+            )
+
+        dest_claims: dict[tuple[int, int], list[int]] = {}
+        for i in range(total_ants):
+            action = candidate_sequences[i][pointers[i]]
+            dest = get_dest(i, action)
+            dest_claims.setdefault(dest, []).append(i)
+
+        losers: list[int] = []
+        for dest, claimants in dest_claims.items():
+            if len(claimants) <= 1:
+                continue
+
+            holding_ants = [
+                i for i in claimants
+                if candidate_sequences[i][pointers[i]] == HOLD and mine_list[i] == dest
+            ]
+
+            if holding_ants:
+                winner = holding_ants[0]
+            else:
+                winner = min(claimants, key=get_priority)
+
+            for i in claimants:
+                if i != winner:
+                    losers.append(i)
+                    rej_act = candidate_sequences[i][pointers[i]]
+                    if rej_act != HOLD and rejections_out is not None:
+                        if isinstance(rejections_out, dict):
+                            rejections_out.setdefault(i, {})[rej_act] = RejectionCode.TAKEN.value
+                        elif isinstance(rejections_out, list):
+                            rejections_out[i][rej_act] = RejectionCode.TAKEN.value
+
+        if not losers:
+            break
+
+        for i in losers:
+            pointers[i] += 1
+            if pointers[i] >= len(candidate_sequences[i]):
+                raise AssertionError(f"蚂蚁 {i} 候选序列被非法耗尽，缺少保底 HOLD")
+
+    orders = np.array(
+        [candidate_sequences[i][pointers[i]] for i in range(total_ants)],
+        dtype=np.int64,
+    )
+
+    updated_stalls: dict[int, int] = {}
+    for i in range(total_ants):
+        aid = ant_ids[i]
+        final_act = orders[i]
+        if final_act != HOLD:
+            updated_stalls[aid] = 0
+        else:
+            if pointers[i] > 0:
+                updated_stalls[aid] = current_stalls.get(aid, 0) + 1
+            else:
+                updated_stalls[aid] = 0
+
+    if stall_counters is not None:
+        stall_counters.clear()
+        stall_counters.update(updated_stalls)
+
+    if return_iteration_count:
+        return orders, updated_stalls, iteration_count
+    return orders, updated_stalls
+
+
+def get_known_enemy_hills(
+    obs: dict,
+    water: np.ndarray,
+    seen: np.ndarray,
+    memory: dict | None,
+) -> set[tuple[int, int]]:
+    """从当前观测与记忆中提取所有已知且未确认被摧毁的敌方蚁丘坐标。"""
+    rows, cols = obs["size"]
+    visible = seen & ~water
+    hills: set[tuple[int, int]] = set()
+
+    for r, c, owner in obs.get("hills", []):
+        if owner != 0:
+            hills.add((int(r), int(c)))
+
+    if memory:
+        for r, c in memory.get("hill_foe_seen", ()):
+            r_i, c_i = int(r), int(c)
+            if 0 <= r_i < rows and 0 <= c_i < cols and not visible[r_i, c_i]:
+                hills.add((r_i, c_i))
+
+    return hills
+
+
+def _dispatch_task_state_machine(
+    mine: list[list[int]] | list[tuple[int, int]],
+    obs: dict,
+    water: np.ndarray,
+    seen: np.ndarray,
+    memory: dict | None,
+    max_depth: int | None,
+    min_raid_ants: int | None = None,
+    raid_ratio: float = 0.5,
+    collect_telemetry: bool = False,
+    stall_counters: dict[int, int] | None = None,
+    fair_mode: bool = True,
+) -> tuple[np.ndarray, list[TelemetryRecord]]:
+    """显式任务分配状态机与终点冲突仲裁调度核心实现 (EXP-073B)。"""
+    total_ants = len(mine)
+    if total_ants == 0:
+        return np.zeros(0, dtype=np.int64), []
+
+    rows, cols = obs["size"]
+    ant_positions = {(int(a[0]), int(a[1])) for a in mine}
+    ant_ids_raw = obs.get("ids")
+    if ant_ids_raw is None:
+        ant_ids = list(range(total_ants))
+    else:
+        ant_ids = [int(x) for x in ant_ids_raw]
+
+    food_coords = obs.get("food", [])
+    food_mask = np.zeros((rows, cols), dtype=bool)
+    if food_coords:
+        idx = np.asarray(food_coords, dtype=np.int64)
+        food_mask[idx[:, 0], idx[:, 1]] = True
+
+    blocked = food_mask
+    passable = (~water) & (~food_mask)
+    passable_known = seen & (~water) & (~food_mask)
+
+    enemy_hills = get_known_enemy_hills(obs, water, seen, memory)
+    friendly_hills_set = {
+        (int(h[0]), int(h[1]))
+        for h in obs.get("hills", [])
+        if len(h) >= 3 and h[2] == 0
+    }
+
+    g_food = extract_food_gathering_points(food_coords, water, rows, cols)
+    visible = seen & ~water
+    mem_food_coords: list[tuple[int, int]] = []
+    if memory:
+        mem_food_coords = [
+            (int(r), int(c))
+            for r, c in memory.get("food_seen", ())
+            if 0 <= int(r) < rows and 0 <= int(c) < cols and not visible[int(r), int(c)]
+        ]
+    g_food_mem = extract_memory_food_gathering_points(
+        mem_food_coords, water, food_mask, g_food, rows, cols
+    )
+    active_food_count = len(food_coords) + len(mem_food_coords)
+
+    g_frontier = extract_exploration_frontier(seen, water, rows, cols, food_mask)
+
+    # 1. 构建采食势能场 V_food
+    source_grid_food = np.zeros((rows, cols), dtype=np.int32)
+    if g_food.any():
+        source_grid_food[g_food] = SOURCE_FOOD_VISIBLE
+    if g_food_mem.any():
+        source_grid_food[g_food_mem & (source_grid_food == SOURCE_NONE)] = SOURCE_FOOD_MEMORY
+
+    if g_food.any() or g_food_mem.any():
+        sources_food = {0: g_food}
+        if g_food_mem.any():
+            sources_food[1] = g_food_mem
+        dist_food, meta_food = compute_geodesic_potential_field(
+            sources=sources_food,
+            passable_mask=passable,
+            rows=rows,
+            cols=cols,
+            max_depth=max_depth,
+            return_meta=True,
+            source_grid=source_grid_food,
+        )
+    else:
+        dist_food = np.full((rows, cols), FAR, dtype=np.int32)
+        meta_food = FieldMetadata(
+            frontier_size=0,
+            frontier_nonempty_at_limit=False,
+            source_grid=source_grid_food,
+        )
+
+    # 2. 构建探索前沿势能场 V_frontier
+    source_grid_frontier = np.zeros((rows, cols), dtype=np.int32)
+    if g_frontier.any():
+        source_grid_frontier[g_frontier] = SOURCE_FRONTIER_UNSEEN
+        dist_frontier, meta_frontier = compute_geodesic_potential_field(
+            sources={0: g_frontier},
+            passable_mask=passable_known,
+            rows=rows,
+            cols=cols,
+            max_depth=max_depth,
+            return_meta=True,
+            source_grid=source_grid_frontier,
+            initial_source_type=SOURCE_FRONTIER_UNSEEN,
+        )
+    else:
+        dist_frontier = np.full((rows, cols), FAR, dtype=np.int32)
+        meta_frontier = FieldMetadata(
+            frontier_size=0,
+            frontier_nonempty_at_limit=False,
+            source_grid=source_grid_frontier,
+        )
+
+    # 3. 构建攻坚势能场 V_hill
+    source_grid_hill = np.zeros((rows, cols), dtype=np.int32)
+    if enemy_hills:
+        hills_mask = np.zeros((rows, cols), dtype=bool)
+        for r, c in enemy_hills:
+            if passable[r, c]:
+                hills_mask[r, c] = True
+                source_grid_hill[r, c] = SOURCE_HILL_FOE
+        if hills_mask.any():
+            dist_hill, meta_hill = compute_geodesic_potential_field(
+                sources={0: hills_mask},
+                passable_mask=passable,
+                rows=rows,
+                cols=cols,
+                max_depth=max_depth,
+                return_meta=True,
+                source_grid=source_grid_hill,
+                initial_source_type=SOURCE_HILL_FOE,
+            )
+        else:
+            dist_hill = np.full((rows, cols), FAR, dtype=np.int32)
+            meta_hill = FieldMetadata(
+                frontier_size=0,
+                frontier_nonempty_at_limit=False,
+                source_grid=source_grid_hill,
+            )
+    else:
+        dist_hill = np.full((rows, cols), FAR, dtype=np.int32)
+        meta_hill = FieldMetadata(
+            frontier_size=0,
+            frontier_nonempty_at_limit=False,
+            source_grid=source_grid_hill,
+        )
+
+    # 4. 构建守备势能场 V_fortify
+    source_grid_fortify = np.zeros((rows, cols), dtype=np.int32)
+    if friendly_hills_set:
+        friendly_mask = np.zeros((rows, cols), dtype=bool)
+        for r, c in friendly_hills_set:
+            if passable[r, c]:
+                friendly_mask[r, c] = True
+        if friendly_mask.any():
+            dist_fortify, meta_fortify = compute_geodesic_potential_field(
+                sources={0: friendly_mask},
+                passable_mask=passable,
+                rows=rows,
+                cols=cols,
+                max_depth=max_depth,
+                return_meta=True,
+                source_grid=source_grid_fortify,
+            )
+        else:
+            dist_fortify = np.full((rows, cols), FAR, dtype=np.int32)
+            meta_fortify = FieldMetadata(
+                frontier_size=0,
+                frontier_nonempty_at_limit=False,
+                source_grid=source_grid_fortify,
+            )
+    else:
+        dist_fortify = np.full((rows, cols), FAR, dtype=np.int32)
+        meta_fortify = FieldMetadata(
+            frontier_size=0,
+            frontier_nonempty_at_limit=False,
+            source_grid=source_grid_fortify,
+        )
+
+    # 5. 任务状态机分配
+    is_phase_b = (
+        min_raid_ants is not None
+        and len(enemy_hills) > 0
+        and total_ants >= min_raid_ants
+    )
+
+    raid_set: set[int] = set()
+    if is_phase_b:
+        num_raid = max(1, min(total_ants - 1, int(round(total_ants * raid_ratio))))
+        sorted_by_hill = sorted(
+            range(total_ants),
+            key=lambda idx: (dist_hill[int(mine[idx][0]), int(mine[idx][1])], idx),
+        )
+        for idx in sorted_by_hill:
+            if len(raid_set) < num_raid and dist_hill[int(mine[idx][0]), int(mine[idx][1])] < FAR:
+                raid_set.add(idx)
+
+    non_raid_ants = [idx for idx in range(total_ants) if idx not in raid_set]
+
+    k_gather = min(len(non_raid_ants), active_food_count)
+    sorted_by_food = sorted(
+        non_raid_ants,
+        key=lambda idx: (dist_food[int(mine[idx][0]), int(mine[idx][1])], idx),
+    )
+    gather_set: set[int] = set()
+    for idx in sorted_by_food:
+        if len(gather_set) < k_gather and dist_food[int(mine[idx][0]), int(mine[idx][1])] < FAR:
+            gather_set.add(idx)
+
+    ant_tasks: dict[int, TaskState] = {}
+    for idx in raid_set:
+        ant_tasks[idx] = TaskState.ASSAULT
+    for idx in gather_set:
+        ant_tasks[idx] = TaskState.GATHER
+
+    remaining_ants = [idx for idx in non_raid_ants if idx not in gather_set]
+    for idx in remaining_ants:
+        ar, ac = int(mine[idx][0]), int(mine[idx][1])
+        if dist_frontier[ar, ac] < FAR:
+            ant_tasks[idx] = TaskState.EXPLORE
+        elif dist_hill[ar, ac] < FAR:
+            ant_tasks[idx] = TaskState.ASSAULT
+        elif friendly_hills_set and dist_fortify[ar, ac] < FAR:
+            ant_tasks[idx] = TaskState.FORTIFY
+        elif (dist_food < FAR).any():
+            ant_tasks[idx] = TaskState.GATHER
+        elif (dist_frontier < FAR).any():
+            ant_tasks[idx] = TaskState.EXPLORE
+        elif (dist_hill < FAR).any():
+            ant_tasks[idx] = TaskState.ASSAULT
+        elif friendly_hills_set and (dist_fortify < FAR).any():
+            ant_tasks[idx] = TaskState.FORTIFY
+        else:
+            ant_tasks[idx] = TaskState.EXPLORE
+
+    ant_dist_map: dict[int, tuple[np.ndarray, FieldMetadata]] = {}
+    for i in range(total_ants):
+        task = ant_tasks[i]
+        if task == TaskState.ASSAULT:
+            ant_dist_map[i] = (dist_hill, meta_hill)
+        elif task == TaskState.GATHER:
+            ant_dist_map[i] = (dist_food, meta_food)
+        elif task == TaskState.EXPLORE:
+            ant_dist_map[i] = (dist_frontier, meta_frontier)
+        else:
+            ant_dist_map[i] = (dist_fortify, meta_fortify)
+
+    if is_phase_b:
+        squad_tiers = [0 if i in raid_set else 1 for i in range(total_ants)]
+    else:
+        squad_tiers = None
+
+    potentials = np.zeros(total_ants, dtype=np.int32)
+    candidate_sequences: list[list[int]] = []
+    candidate_rejections_map: dict[int, dict[int, str]] = {
+        i: {} for i in range(total_ants)
+    }
+
+    for i in range(total_ants):
+        ar, ac = int(mine[i][0]), int(mine[i][1])
+        dist_field, _ = ant_dist_map[i]
+        cur_d = int(dist_field[ar, ac])
+        potentials[i] = cur_d
+        rejections = candidate_rejections_map[i]
+        valid_moves: list[tuple[int, int]] = []
+
+        for k in range(4):
+            dr, dc = DELTAS[k]
+            nr, nc = (ar + dr) % rows, (ac + dc) % cols
+            if water[nr, nc]:
+                rejections[k] = RejectionCode.WATER.value
+                continue
+            if blocked[nr, nc]:
+                rejections[k] = RejectionCode.FOOD.value
+                continue
+            if dist_field[nr, nc] >= cur_d:
+                if (nr, nc) in ant_positions:
+                    rejections[k] = RejectionCode.TAKEN.value
+                else:
+                    rejections[k] = RejectionCode.GRADIENT_NON_DECREASING.value
+                continue
+            valid_moves.append((int(dist_field[nr, nc]), k))
+
+        valid_moves.sort(key=lambda item: (item[0], item[1]))
+        cand_seq = [item[1] for item in valid_moves]
+        cand_seq.append(HOLD)
+        candidate_sequences.append(cand_seq)
+
+    out, _ = arbitrate_orders(
+        mine_coords=mine,
+        candidate_sequences=candidate_sequences,
+        potentials=potentials,
+        stall_counters=stall_counters,
+        fair_mode=fair_mode,
+        rows=rows,
+        cols=cols,
+        ids=ant_ids,
+        squad_tiers=squad_tiers,
+        rejections_out=candidate_rejections_map,
+    )
+
+    telemetry_records: list[TelemetryRecord] = []
+    if collect_telemetry:
+        visible_food_set = {tuple(f) for f in food_coords}
+        for i in range(total_ants):
+            ant_id = ant_ids[i]
+            ar, ac = int(mine[i][0]), int(mine[i][1])
+            dist_field, meta_field = ant_dist_map[i]
+            pot_self = int(dist_field[ar, ac])
+            has_reachable = bool((dist_field < FAR).any())
+            is_stale = (pot_self == int(FAR) and has_reachable)
+
+            effective_friendly_hills = friendly_hills_set
+
+            record = evaluate_ant_telemetry(
+                ant_id=int(ant_id),
+                pos=(ar, ac),
+                dist=dist_field,
+                field_meta=meta_field,
+                candidate_rejections=candidate_rejections_map.get(i, {}),
+                action=int(out[i]),
+                visible_food=visible_food_set,
+                friendly_hills=effective_friendly_hills,
+                is_stale=is_stale,
+            )
+            telemetry_records.append(record)
+
+    return out, telemetry_records
+
+
 class Teacher:
     """每个进程维护一个实例即可；它在回合之间不保留任何状态，可安全复用。"""
 
-    def __init__(self, hill_lead: int = 6, max_depth: int = 32):
+    def __init__(self, hill_lead: int = 6, max_depth: int | None = None):
         if hill_lead < 0:
             raise ValueError(f"hill_lead must be non-negative, got {hill_lead}")
-        if max_depth < 1:
+        if max_depth is not None and max_depth < 1:
             raise ValueError(f"max_depth must be positive, got {max_depth}")
         self.hill_lead = hill_lead
-        # 蚂蚁每次仅决策一步，因此距离目标 60 格与距离目标 30 格会导出完全相同的移动决策。
-        # 因此为泛洪深度设定上限在对局质量上是零损失的，同时占据了绝大部分运行时间优化：
-        # 若不设上限，前沿种子会使得纯 Python 循环在每个座位的每个回合遍历棋盘的几乎每一个单元格。
         self.max_depth = max_depth
+        self.stall_counters: dict[int, int] = {}
+        self._turn_telemetry: list[TelemetryRecord] = []
+
+    def reset_stall_counters(self) -> None:
+        self.stall_counters.clear()
+
+    def reset(self) -> None:
+        self.reset_stall_counters()
 
     def __repr__(self) -> str:
         return f"Teacher(hill_lead={self.hill_lead}, max_depth={self.max_depth})"
 
     # ---- 势能场构建 ----------------------------------------------------------------
 
-    def field(self, obs: dict, water: np.ndarray, seen: np.ndarray,
-              memory: dict | None = None) -> np.ndarray:
-        """计算到最近目标的距离场，跨越已知可行走单元格并在环面上无缝环绕。
-
-        未探索的单元格既是可行走的，*也是*目标点：这使得单个势能场能同时驱动采食与探索，
-        也是视野内空无一物时蚁群依然向外扩散而非陷入原地发呆的原因。
-
-        `memory` 是座位的记忆状态，格式为 `{plane: [[r, c], ...]}`，由 `planes.remember` 维护，
-        若为遗忘型教师则传入 None（模块文档说明了其引入的差异）。
-
-        **采用 NumPy 波前扩散，而非队列。** 在修复 `dilate` 后，被本实现替换的原版 Python BFS 占了训练循环耗时的 93% ——
-        在两分钟的性能分析中累计进行了 1160 万次 deque 操作，因为前沿种子几乎将整个棋盘都变成了目标。
-        一次性向外扩展整个圆环波前，用 `max_depth` 次数组运算完成了相同的泛洪扩散，取代了原先每个访问单元格一次 Python 迭代的开销。
-
-        各层级通过偏移量平移，使得最早的种子从 0 开始：敌方蚁穴从 0 开始，食物从 `hill_lead` 开始，未知前沿比食物再晚两层。
-        算法中仅比较差值，因此偏移量开销为零 —— 且起步领先是优先选择目标的正确方式，距离场上的乘法系数会破坏泛洪单调性，是常见的 Bug。
-        """
+    def field(
+        self,
+        obs: dict,
+        water: np.ndarray,
+        seen: np.ndarray,
+        memory: dict | None = None,
+        return_meta: bool = False,
+    ) -> np.ndarray | tuple[np.ndarray, FieldMetadata]:
+        """计算到最近目标的距离场，跨越已知可行走单元格并在环面上无缝环绕。"""
         rows, cols = obs["size"]
-        dist = np.full((rows, cols), FAR, dtype=np.int32)
-        passable = ~water
+        food_mask = np.zeros((rows, cols), dtype=bool)
+        if obs.get("food"):
+            idx = np.asarray(obs["food"], dtype=np.int64)
+            food_mask[idx[:, 0], idx[:, 1]] = True
+        passable = (~water) & (~food_mask)
+        source_grid = np.zeros((rows, cols), dtype=np.int32)
 
         at_level: dict[int, np.ndarray] = {}
 
         def seed(mask: np.ndarray, level: int) -> None:
+            if not mask.any():
+                return
             if level in at_level:
                 at_level[level] |= mask
             else:
                 at_level[level] = mask.copy()
 
         hills = np.zeros((rows, cols), dtype=bool)
-        for r, c, owner in obs["hills"]:
+        for r, c, owner in obs.get("hills", []):
             if owner != 0:
                 hills[r, c] = True
         if memory:
-            # 座位本回合能够看到的视野：`seen` 是已知水域或当前可见区域，因此当前可见区域是其中非水域的部分。
             visible = seen & ~water
-            # 记住的敌方蚁穴始终作为目标，除非其所在方格已进入视野且上面没有蚁穴（意味着已被摧毁）。
-            # 记忆本身从不主动遗忘；教师模型对照当前视野对其进行校验，具备相同双输入的模型能够学会相同的判断逻辑。
             for r, c in memory.get("hill_foe_seen", ()):
                 if not visible[r, c]:
                     hills[r, c] = True
         if hills.any():
-            seed(hills, 0)
+            seed(hills & passable, 0)
+            source_grid[(hills & passable)] = SOURCE_HILL_FOE
 
-        if obs["food"]:
-            food = np.zeros((rows, cols), dtype=bool)
-            idx = np.asarray(obs["food"], dtype=np.int64)
-            food[idx[:, 0], idx[:, 1]] = True
-            seed(food, self.hill_lead)
+        g_food = extract_food_gathering_points(obs.get("food", []), water, rows, cols)
+        if g_food.any():
+            seed(g_food, self.hill_lead)
+            source_grid[g_food & (source_grid == SOURCE_NONE)] = SOURCE_FOOD_VISIBLE
 
         if memory:
-            # 曾经见过但当前处于视野外的食物：食物会重新刷新的位置，优先级比视野内食物低一级。
-            # 进入当前视野的记住单元格若无食物则直接跳过。
-            recalled = np.zeros((rows, cols), dtype=bool)
-            for r, c in memory.get("food_seen", ()):
-                if not visible[r, c]:
-                    recalled[r, c] = True
-            if recalled.any():
-                seed(recalled & passable, self.hill_lead + 1)
+            visible = seen & ~water
+            mem_food_coords = [
+                (int(r), int(c))
+                for r, c in memory.get("food_seen", ())
+                if 0 <= int(r) < rows and 0 <= int(c) < cols and not visible[int(r), int(c)]
+            ]
+            g_food_mem = extract_memory_food_gathering_points(
+                mem_food_coords, water, food_mask, g_food, rows, cols
+            )
+            if g_food_mem.any():
+                seed(g_food_mem, self.hill_lead + 1)
+                source_grid[g_food_mem & (source_grid == SOURCE_NONE)] = SOURCE_FOOD_MEMORY
 
-        unseen = ~seen
-        if unseen.any():
-            # 每一个未探索单元格，而非对其采样：在泛洪向量化后，没有任何理由对未知前沿进行近似，
-            # 采样会导致蚁群对地图边界产生粗糙、不均的理解。
-            seed(unseen & passable, self.hill_lead + 2)
+        g_frontier = extract_exploration_frontier(seen, water, rows, cols, food_mask)
+        if g_frontier.any():
+            seed(g_frontier, self.hill_lead + 2)
+            source_grid[g_frontier & (source_grid == SOURCE_NONE)] = SOURCE_FRONTIER_UNSEEN
 
-        if not at_level:
-            return dist
+        return compute_geodesic_potential_field(
+            sources=at_level,
+            passable_mask=passable,
+            rows=rows,
+            cols=cols,
+            max_depth=self.max_depth,
+            return_meta=return_meta,
+            source_grid=source_grid,
+        )
 
-        wave = np.zeros((rows, cols), dtype=bool)
-        for depth in range(0, self.max_depth + 1):
-            step = at_level.pop(depth, None)
-            if wave.any():
-                spread = (
-                    np.roll(wave, 1, 0) | np.roll(wave, -1, 0)
-                    | np.roll(wave, 1, 1) | np.roll(wave, -1, 1)
-                )
-                step = spread if step is None else (spread | step)
-            if step is None:
-                continue
-            step &= passable & (dist == FAR)
-            if not step.any() and not at_level:
-                break
-            dist[step] = depth
-            wave = step
-        return dist
+    def _get_known_enemy_hills(
+        self,
+        obs: dict,
+        water: np.ndarray,
+        seen: np.ndarray,
+        memory: dict | None,
+    ) -> set[tuple[int, int]]:
+        return get_known_enemy_hills(obs, water, seen, memory)
 
     # ---- 动作决策 ------------------------------------------------------------------
 
-    def orders(self, obs: dict, water: np.ndarray, seen: np.ndarray,
-               memory: dict | None = None) -> np.ndarray:
-        """输出每只蚂蚁的移动动作索引，按位置与 `mine` 严格对齐。传入 `memory` 时，
-        教师模型具备记忆能力（参见模块文档）；未传入时为遗忘型教师。"""
-        mine = obs["mine"]
+    def orders(
+        self,
+        obs: dict,
+        water: np.ndarray,
+        seen: np.ndarray,
+        memory: dict | None = None,
+        collect_telemetry: bool = False,
+        stall_counters: dict[int, int] | None = None,
+        fair_mode: bool = True,
+    ) -> np.ndarray:
+        mine = obs.get("mine")
         if not mine:
+            self._turn_telemetry = []
             return np.zeros(0, dtype=np.int64)
 
         rows, cols = obs["size"]
-        dist = self.field(obs, water, seen, memory)
-        # 食物与水一样会阻挡移动（参见 `ants/engine/src/turn.rs`），因此指令移动到食物上的蚂蚁
-        # 会留在原地 —— 这白白浪费了回合，更糟的是会误导神经网络以为不会被阻挡。
+        if collect_telemetry:
+            dist, field_meta = self.field(obs, water, seen, memory, return_meta=True)
+        else:
+            dist = self.field(obs, water, seen, memory, return_meta=False)
+            field_meta = None
+
         blocked = np.zeros((rows, cols), dtype=bool)
-        for r, c in obs["food"]:
+        for r, c in obs.get("food", []):
             blocked[r, c] = True
 
-        taken = {tuple(a) for a in mine}
-        out = np.full(len(mine), HOLD, dtype=np.int64)
+        ant_positions = {(int(a[0]), int(a[1])) for a in mine}
+        total_ants = len(mine)
+        candidate_sequences: list[list[int]] = []
+        candidate_rejections_map: dict[int, dict[int, str]] = {
+            i: {} for i in range(total_ants)
+        }
+        potentials = np.zeros(total_ants, dtype=np.int32)
 
-        # 距离最近的蚂蚁优先决策，确保对方格具有最强占有权的蚂蚁获得该方格。
-        # 排序平局按蚂蚁索引打破，对应 `mine` 的顺序（引擎固定为行优先）—— 因此这也是完全确定性的。
-        order = sorted(range(len(mine)), key=lambda i: (dist[mine[i][0], mine[i][1]], i))
-        for i in order:
-            ar, ac = mine[i]
-            best, best_d = HOLD, dist[ar, ac]
-            # 固定方向顺序，且仅在严格更优时才转移。在开阔地带两个等距邻居非常普遍，
-            # 若随机选择会导致四分之一的标签无法被网络学习。
+        for i in range(total_ants):
+            ar, ac = int(mine[i][0]), int(mine[i][1])
+            cur_d = int(dist[ar, ac])
+            potentials[i] = cur_d
+            rejections = candidate_rejections_map[i]
+            valid_moves: list[tuple[int, int]] = []
+
             for k in range(4):
                 dr, dc = DELTAS[k]
                 nr, nc = (ar + dr) % rows, (ac + dc) % cols
-                if water[nr, nc] or blocked[nr, nc] or (nr, nc) in taken:
+                if water[nr, nc]:
+                    rejections[k] = RejectionCode.WATER.value
                     continue
-                if dist[nr, nc] < best_d:
-                    best, best_d = k, dist[nr, nc]
-            if best != HOLD:
-                dr, dc = DELTAS[best]
-                nr, nc = (ar + dr) % rows, (ac + dc) % cols
-                taken.discard((ar, ac))
-                taken.add((nr, nc))
-            out[i] = best
+                if blocked[nr, nc]:
+                    rejections[k] = RejectionCode.FOOD.value
+                    continue
+                if dist[nr, nc] >= cur_d:
+                    if (nr, nc) in ant_positions:
+                        rejections[k] = RejectionCode.TAKEN.value
+                    else:
+                        rejections[k] = RejectionCode.GRADIENT_NON_DECREASING.value
+                    continue
+                valid_moves.append((int(dist[nr, nc]), k))
+
+            valid_moves.sort(key=lambda item: (item[0], item[1]))
+            cand_seq = [item[1] for item in valid_moves]
+            cand_seq.append(HOLD)
+            candidate_sequences.append(cand_seq)
+
+        ant_ids = obs.get("ids")
+        out, _ = arbitrate_orders(
+            mine_coords=mine,
+            candidate_sequences=candidate_sequences,
+            potentials=potentials,
+            stall_counters=stall_counters,
+            fair_mode=fair_mode,
+            rows=rows,
+            cols=cols,
+            ids=ant_ids,
+            rejections_out=candidate_rejections_map,
+        )
+
+        if collect_telemetry:
+            visible_food_set = {tuple(f) for f in obs.get("food", [])}
+            friendly_hills_set = {
+                (int(h[0]), int(h[1]))
+                for h in obs.get("hills", [])
+                if len(h) >= 3 and h[2] == 0
+            }
+            has_reachable = bool((dist < FAR).any())
+
+            telemetry_records: list[TelemetryRecord] = []
+            for i in range(len(mine)):
+                ant_id = ant_ids[i] if (ant_ids is not None and i < len(ant_ids)) else i
+                ar, ac = mine[i]
+                pot_self = int(dist[ar, ac])
+                is_stale = (pot_self == int(FAR) and has_reachable)
+                record = evaluate_ant_telemetry(
+                    ant_id=int(ant_id),
+                    pos=(ar, ac),
+                    dist=dist,
+                    field_meta=field_meta,
+                    candidate_rejections=candidate_rejections_map.get(i, {}),
+                    action=int(out[i]),
+                    visible_food=visible_food_set,
+                    friendly_hills=friendly_hills_set,
+                    is_stale=is_stale,
+                )
+                telemetry_records.append(record)
+            self._turn_telemetry = telemetry_records
+        else:
+            self._turn_telemetry = []
+
         return out
+
+    def export_turn_telemetry(self) -> list[TelemetryRecord]:
+        return list(self._turn_telemetry)
+
+    def orders_with_telemetry(
+        self,
+        obs: dict,
+        water: np.ndarray,
+        seen: np.ndarray,
+        memory: dict | None = None,
+        stall_counters: dict[int, int] | None = None,
+        fair_mode: bool = True,
+    ) -> tuple[np.ndarray, list[TelemetryRecord]]:
+        orders = self.orders(
+            obs,
+            water,
+            seen,
+            memory,
+            collect_telemetry=True,
+            stall_counters=stall_counters,
+            fair_mode=fair_mode,
+        )
+        return orders, self.export_turn_telemetry()
+
+    def act(
+        self,
+        obs: dict,
+        memory: dict | None = None,
+        collect_telemetry: bool = False,
+        stall_counters: dict[int, int] | None = None,
+        fair_mode: bool = True,
+    ) -> list[int]:
+        water, seen = known(obs)
+        return self.orders(
+            obs,
+            water,
+            seen,
+            memory,
+            collect_telemetry=collect_telemetry,
+            stall_counters=stall_counters,
+            fair_mode=fair_mode,
+        ).tolist()
+
+    def act_with_telemetry(
+        self,
+        obs: dict,
+        memory: dict | None = None,
+        stall_counters: dict[int, int] | None = None,
+        fair_mode: bool = True,
+    ) -> tuple[list[int], list[TelemetryRecord]]:
+        water, seen = known(obs)
+        orders = self.orders(
+            obs,
+            water,
+            seen,
+            memory,
+            collect_telemetry=True,
+            stall_counters=stall_counters,
+            fair_mode=fair_mode,
+        )
+        return orders.tolist(), self.export_turn_telemetry()
 
 
 class CompoundTeacher:
     """条件复合启发式教师：态势感知动态分工调度（IDEA-002 R2/EXP-014）。
 
     每个进程维护一个实例即可；它在回合之间不保留内部状态，可安全复用。
-
-    ## 核心调度逻辑
-    1. **态势感知（Situational Awareness）**：
-       从公开观测 `obs["hills"]` 与座位记忆 `memory["hill_foe_seen"]` 中实时识别已探明且未被摧毁的敌方蚁丘。
-       已进入当前视野但上方无蚁穴的记忆坐标被判定为已被摧毁，自动过滤。
-    2. **动态兵工分工（Dynamic Squad Division）**：
-       - **阶段 A（全员觅食与探索）**：若未探明敌方蚁丘，或己方存活蚂蚁数不足 `min_raid_ants`（默认 4），
-         100% 兵力优先执行食物采集与未知前沿开拓，迅速建立初始经济人口基础。
-       - **阶段 B（动态突击与经济维持）**：一旦探明敌方蚁丘且存活蚂蚁达到阈值，动态划分：
-         - **突击分队（Raid Squad）**：距离敌方蚁丘最近的比例蚂蚁（由 `raid_ratio` 控制，默认 50%），直扑敌方蚁穴实施摧毁；
-         - **采食分队（Gather Squad）**：其余蚂蚁持续在后方采集食物，保障蚁巢源源不断产卵补充兵力。
-    3. **无碰撞仲裁（Collision-Free Arbitration）**：
-       维护统一共享的 `taken` 集合。突击分队具备行进绝对优先权率先决策并锁定占有格，
-       采食分队在剩余可行空间中决策。严格杜绝友军互撞、入水与撞食，输出完全确定性的动作标签。
     """
 
     def __init__(
         self,
         min_raid_ants: int = 4,
         raid_ratio: float = 0.5,
-        max_depth: int = 32,
+        max_depth: int | None = None,
         hill_lead: int = 6,
     ):
         if min_raid_ants < 1:
             raise ValueError(f"min_raid_ants must be >= 1, got {min_raid_ants}")
         if not (0.0 < raid_ratio <= 1.0):
             raise ValueError(f"raid_ratio must be in (0.0, 1.0], got {raid_ratio}")
-        if max_depth < 1:
+        if max_depth is not None and max_depth < 1:
             raise ValueError(f"max_depth must be >= 1, got {max_depth}")
         if hill_lead < 0:
             raise ValueError(f"hill_lead must be non-negative, got {hill_lead}")
@@ -254,6 +1059,14 @@ class CompoundTeacher:
         self.raid_ratio = raid_ratio
         self.max_depth = max_depth
         self.hill_lead = hill_lead
+        self.stall_counters: dict[int, int] = {}
+        self._turn_telemetry: list[TelemetryRecord] = []
+
+    def reset_stall_counters(self) -> None:
+        self.stall_counters.clear()
+
+    def reset(self) -> None:
+        self.reset_stall_counters()
 
     def __repr__(self) -> str:
         return (
@@ -271,24 +1084,7 @@ class CompoundTeacher:
         seen: np.ndarray,
         memory: dict | None,
     ) -> set[tuple[int, int]]:
-        """从当前观测与记忆中提取所有已知且未确认被摧毁的敌方蚁丘坐标。"""
-        rows, cols = obs["size"]
-        visible = seen & ~water
-        hills: set[tuple[int, int]] = set()
-
-        # 1. 当前观测中可见的敌方蚁丘（非 0 号观察者自己）
-        for r, c, owner in obs.get("hills", []):
-            if owner != 0:
-                hills.add((int(r), int(c)))
-
-        # 2. 记忆中记录的敌方蚁丘（仅保留尚未进入当前视野被确认消除的坐标）
-        if memory:
-            for r, c in memory.get("hill_foe_seen", ()):
-                r, c = int(r), int(c)
-                if 0 <= r < rows and 0 <= c < cols and not visible[r, c]:
-                    hills.add((r, c))
-
-        return hills
+        return get_known_enemy_hills(obs, water, seen, memory)
 
     # ---- 势能场构建 ----------------------------------------------------------------
 
@@ -298,105 +1094,112 @@ class CompoundTeacher:
         water: np.ndarray,
         seen: np.ndarray,
         memory: dict | None,
-        fallback_hills: set[tuple[int, int]],
-    ) -> np.ndarray:
+        fallback_hills: set[tuple[int, int]] | None = None,
+        return_meta: bool = False,
+    ) -> np.ndarray | tuple[np.ndarray, FieldMetadata]:
         """采食与探索势能场：食物优先级最高，其次为未探索前沿，最后为备用敌丘。"""
         rows, cols = obs["size"]
-        dist = np.full((rows, cols), FAR, dtype=np.int32)
-        passable = ~water
+        food_mask = np.zeros((rows, cols), dtype=bool)
+        if obs.get("food"):
+            idx = np.asarray(obs["food"], dtype=np.int64)
+            food_mask[idx[:, 0], idx[:, 1]] = True
+        passable = (~water) & (~food_mask)
+        source_grid = np.zeros((rows, cols), dtype=np.int32)
         at_level: dict[int, np.ndarray] = {}
 
         def seed(mask: np.ndarray, level: int) -> None:
+            if not mask.any():
+                return
             if level in at_level:
                 at_level[level] |= mask
             else:
                 at_level[level] = mask.copy()
 
-        # 1. 视野内的食物：起步领先 0 级（最高优先）
-        if obs.get("food"):
-            food = np.zeros((rows, cols), dtype=bool)
-            idx = np.asarray(obs["food"], dtype=np.int64)
-            food[idx[:, 0], idx[:, 1]] = True
-            seed(food & passable, 0)
+        # 1. 视野内的食物合法采集位：0 级（最高优先）
+        g_food = extract_food_gathering_points(obs.get("food", []), water, rows, cols)
+        if g_food.any():
+            seed(g_food, 0)
+            source_grid[g_food & (source_grid == SOURCE_NONE)] = SOURCE_FOOD_VISIBLE
 
-        # 2. 记忆中视野外的食物：第 1 级
+        # 2. 记忆中视野外的食物合法采集位：第 1 级
         if memory:
             visible = seen & ~water
-            recalled = np.zeros((rows, cols), dtype=bool)
-            for r, c in memory.get("food_seen", ()):
-                r, c = int(r), int(c)
-                if 0 <= r < rows and 0 <= c < cols and not visible[r, c]:
-                    recalled[r, c] = True
-            if recalled.any():
-                seed(recalled & passable, 1)
+            mem_food_coords = [
+                (int(r), int(c))
+                for r, c in memory.get("food_seen", ())
+                if 0 <= int(r) < rows and 0 <= int(c) < cols and not visible[int(r), int(c)]
+            ]
+            g_food_mem = extract_memory_food_gathering_points(
+                mem_food_coords, water, food_mask, g_food, rows, cols
+            )
+            if g_food_mem.any():
+                seed(g_food_mem, 1)
+                source_grid[g_food_mem & (source_grid == SOURCE_NONE)] = SOURCE_FOOD_MEMORY
 
         # 3. 未知探索前沿：第 2 级
-        unseen = ~seen
-        if unseen.any():
-            seed(unseen & passable, 2)
+        g_frontier = extract_exploration_frontier(seen, water, rows, cols, food_mask)
+        if g_frontier.any():
+            seed(g_frontier, 2)
+            source_grid[g_frontier & (source_grid == SOURCE_NONE)] = SOURCE_FRONTIER_UNSEEN
 
-        # 4. 备用敌丘目标：当食物全被采光且全图探索完毕时，作为最低兜底引导
-        if fallback_hills:
+        # 4. 备用敌丘目标：当无其他目标时作为独立兜底源点（0 级）
+        if fallback_hills and not at_level:
             fh = np.zeros((rows, cols), dtype=bool)
             for r, c in fallback_hills:
-                fh[r, c] = True
-            seed(fh & passable, self.max_depth)
+                if passable[r, c]:
+                    fh[r, c] = True
+            if fh.any():
+                seed(fh, 0)
+                source_grid[fh & (source_grid == SOURCE_NONE)] = SOURCE_HILL_FOE
 
-        if not at_level:
-            return dist
-
-        wave = np.zeros((rows, cols), dtype=bool)
-        for depth in range(0, self.max_depth + 1):
-            step = at_level.pop(depth, None)
-            if wave.any():
-                spread = (
-                    np.roll(wave, 1, 0) | np.roll(wave, -1, 0)
-                    | np.roll(wave, 1, 1) | np.roll(wave, -1, 1)
-                )
-                step = spread if step is None else (spread | step)
-            if step is None:
-                continue
-            step &= passable & (dist == FAR)
-            if not step.any() and not at_level:
-                break
-            dist[step] = depth
-            wave = step
-        return dist
+        return compute_geodesic_potential_field(
+            sources=at_level,
+            passable_mask=passable,
+            rows=rows,
+            cols=cols,
+            max_depth=self.max_depth,
+            return_meta=return_meta,
+            source_grid=source_grid,
+        )
 
     def field_raid(
         self,
         obs: dict,
         water: np.ndarray,
         enemy_hills: set[tuple[int, int]],
-    ) -> np.ndarray:
+        return_meta: bool = False,
+    ) -> np.ndarray | tuple[np.ndarray, FieldMetadata]:
         """突击分队专用势能场：以已知敌方蚁丘为唯一初始源点向全图扩散。"""
         rows, cols = obs["size"]
-        dist = np.full((rows, cols), FAR, dtype=np.int32)
+        source_grid = np.zeros((rows, cols), dtype=np.int32)
         if not enemy_hills:
+            dist = np.full((rows, cols), FAR, dtype=np.int32)
+            if return_meta:
+                meta = FieldMetadata(frontier_size=0, frontier_nonempty_at_limit=False, source_grid=source_grid)
+                return dist, meta
             return dist
 
-        passable = ~water
+        food_mask = np.zeros((rows, cols), dtype=bool)
+        if obs.get("food"):
+            idx = np.asarray(obs["food"], dtype=np.int64)
+            food_mask[idx[:, 0], idx[:, 1]] = True
+        passable = (~water) & (~food_mask)
         hills = np.zeros((rows, cols), dtype=bool)
         for r, c in enemy_hills:
-            hills[r, c] = True
+            if passable[r, c]:
+                hills[r, c] = True
+                source_grid[r, c] = SOURCE_HILL_FOE
 
-        step = hills & passable
-        dist[step] = 0
-        wave = step
-        max_d = max(self.max_depth, rows + cols)
-        for depth in range(1, max_d + 1):
-            if not wave.any():
-                break
-            spread = (
-                np.roll(wave, 1, 0) | np.roll(wave, -1, 0)
-                | np.roll(wave, 1, 1) | np.roll(wave, -1, 1)
-            )
-            step = spread & passable & (dist == FAR)
-            if not step.any():
-                break
-            dist[step] = depth
-            wave = step
-        return dist
+        return compute_geodesic_potential_field(
+            sources={0: hills},
+            passable_mask=passable,
+            rows=rows,
+            cols=cols,
+            max_depth=self.max_depth,
+            return_meta=return_meta,
+            source_grid=source_grid,
+            initial_source_type=SOURCE_HILL_FOE,
+        )
 
     # ---- 动作决策与无冲突仲裁 ------------------------------------------------------
 
@@ -406,109 +1209,91 @@ class CompoundTeacher:
         water: np.ndarray,
         seen: np.ndarray,
         memory: dict | None = None,
+        collect_telemetry: bool = False,
+        stall_counters: dict[int, int] | None = None,
+        fair_mode: bool = True,
     ) -> np.ndarray:
-        """输出每只蚂蚁的移动动作索引，严格与 `obs['mine']` 顺序对应。"""
-        mine = obs["mine"]
+        mine = obs.get("mine")
         if not mine:
+            self._turn_telemetry = []
             return np.zeros(0, dtype=np.int64)
 
-        rows, cols = obs["size"]
-        total_ants = len(mine)
-        enemy_hills = self._get_known_enemy_hills(obs, water, seen, memory)
+        orders, telemetry = _dispatch_task_state_machine(
+            mine=mine,
+            obs=obs,
+            water=water,
+            seen=seen,
+            memory=memory,
+            max_depth=self.max_depth,
+            min_raid_ants=self.min_raid_ants,
+            raid_ratio=self.raid_ratio,
+            collect_telemetry=collect_telemetry,
+            stall_counters=stall_counters,
+            fair_mode=fair_mode,
+        )
+        self._turn_telemetry = telemetry
+        return orders
 
-        # 食物阻挡移动（turn.rs:77-85），标记阻挡单元格
-        blocked = np.zeros((rows, cols), dtype=bool)
-        for r, c in obs.get("food", []):
-            blocked[r, c] = True
+    def export_turn_telemetry(self) -> list[TelemetryRecord]:
+        return list(self._turn_telemetry)
 
-        taken = {tuple(a) for a in mine}
-        out = np.full(total_ants, HOLD, dtype=np.int64)
+    def orders_with_telemetry(
+        self,
+        obs: dict,
+        water: np.ndarray,
+        seen: np.ndarray,
+        memory: dict | None = None,
+        stall_counters: dict[int, int] | None = None,
+        fair_mode: bool = True,
+    ) -> tuple[np.ndarray, list[TelemetryRecord]]:
+        orders = self.orders(
+            obs,
+            water,
+            seen,
+            memory,
+            collect_telemetry=True,
+            stall_counters=stall_counters,
+            fair_mode=fair_mode,
+        )
+        return orders, self.export_turn_telemetry()
 
-        gather_dist = self.field_gather(obs, water, seen, memory, enemy_hills)
-
-        # 判定是否进入阶段 B
-        is_phase_b = (len(enemy_hills) > 0) and (total_ants >= self.min_raid_ants)
-
-        if not is_phase_b:
-            # 阶段 A：全员采食与探索
-            order = sorted(range(total_ants), key=lambda i: (gather_dist[mine[i][0], mine[i][1]], i))
-            for i in order:
-                ar, ac = mine[i]
-                best, best_d = HOLD, gather_dist[ar, ac]
-                for k in range(4):
-                    dr, dc = DELTAS[k]
-                    nr, nc = (ar + dr) % rows, (ac + dc) % cols
-                    if water[nr, nc] or blocked[nr, nc] or (nr, nc) in taken:
-                        continue
-                    if gather_dist[nr, nc] < best_d:
-                        best, best_d = k, gather_dist[nr, nc]
-                if best != HOLD:
-                    dr, dc = DELTAS[best]
-                    nr, nc = (ar + dr) % rows, (ac + dc) % cols
-                    taken.discard((ar, ac))
-                    taken.add((nr, nc))
-                out[i] = best
-            return out
-
-        # 阶段 B：动态兵工分工
-        raid_dist = self.field_raid(obs, water, enemy_hills)
-        num_raid = max(1, min(total_ants - 1, int(round(total_ants * self.raid_ratio))))
-
-        # 按到最近敌丘的距离升序排序，确定突击分队成员
-        sorted_by_hill = sorted(range(total_ants), key=lambda i: (raid_dist[mine[i][0], mine[i][1]], i))
-        raid_indices = sorted_by_hill[:num_raid]
-        gather_indices = sorted_by_hill[num_raid:]
-
-        # 第一优先级：突击分队率先移动（沿 raid_dist 势场）
-        for i in raid_indices:
-            ar, ac = mine[i]
-            cur_d = raid_dist[ar, ac]
-            # 若因水域完全隔断导致敌丘不可达，无缝平滑回退至采食势场
-            dist_field = raid_dist if cur_d < FAR else gather_dist
-            best, best_d = HOLD, dist_field[ar, ac]
-
-            for k in range(4):
-                dr, dc = DELTAS[k]
-                nr, nc = (ar + dr) % rows, (ac + dc) % cols
-                if water[nr, nc] or blocked[nr, nc] or (nr, nc) in taken:
-                    continue
-                if dist_field[nr, nc] < best_d:
-                    best, best_d = k, dist_field[nr, nc]
-
-            if best != HOLD:
-                dr, dc = DELTAS[best]
-                nr, nc = (ar + dr) % rows, (ac + dc) % cols
-                taken.discard((ar, ac))
-                taken.add((nr, nc))
-            out[i] = best
-
-        # 第二优先级：采食分队在剩余可用方格中移动（沿 gather_dist 势场）
-        gather_order = sorted(gather_indices, key=lambda j: (gather_dist[mine[j][0], mine[j][1]], j))
-        for j in gather_order:
-            ar, ac = mine[j]
-            best, best_d = HOLD, gather_dist[ar, ac]
-
-            for k in range(4):
-                dr, dc = DELTAS[k]
-                nr, nc = (ar + dr) % rows, (ac + dc) % cols
-                if water[nr, nc] or blocked[nr, nc] or (nr, nc) in taken:
-                    continue
-                if gather_dist[nr, nc] < best_d:
-                    best, best_d = k, gather_dist[nr, nc]
-
-            if best != HOLD:
-                dr, dc = DELTAS[best]
-                nr, nc = (ar + dr) % rows, (ac + dc) % cols
-                taken.discard((ar, ac))
-                taken.add((nr, nc))
-            out[j] = best
-
-        return out
-
-    def act(self, obs: dict, memory: dict | None = None) -> list[int]:
-        """对弈模型标准接口：接收 obs 与可选 memory，返回动作列表。"""
+    def act(
+        self,
+        obs: dict,
+        memory: dict | None = None,
+        collect_telemetry: bool = False,
+        stall_counters: dict[int, int] | None = None,
+        fair_mode: bool = True,
+    ) -> list[int]:
         water, seen = known(obs)
-        return self.orders(obs, water, seen, memory).tolist()
+        return self.orders(
+            obs,
+            water,
+            seen,
+            memory,
+            collect_telemetry=collect_telemetry,
+            stall_counters=stall_counters,
+            fair_mode=fair_mode,
+        ).tolist()
+
+    def act_with_telemetry(
+        self,
+        obs: dict,
+        memory: dict | None = None,
+        stall_counters: dict[int, int] | None = None,
+        fair_mode: bool = True,
+    ) -> tuple[list[int], list[TelemetryRecord]]:
+        water, seen = known(obs)
+        orders = self.orders(
+            obs,
+            water,
+            seen,
+            memory,
+            collect_telemetry=True,
+            stall_counters=stall_counters,
+            fair_mode=fair_mode,
+        )
+        return orders.tolist(), self.export_turn_telemetry()
 
 
 def known(obs: dict) -> tuple[np.ndarray, np.ndarray]:
@@ -523,7 +1308,11 @@ def known(obs: dict) -> tuple[np.ndarray, np.ndarray]:
     rows, cols = obs["size"]
     b = Board(rows, cols)
     water = b.rle(obs["water"]["rle"]).astype(bool)
+    if "vis" in obs and obs["vis"] and "rle" in obs["vis"]:
+        vis_mask = b.rle(obs["vis"]["rle"]).astype(bool)
+        if vis_mask.any():
+            return water, water | vis_mask
     # 单元格若为已知水域或当前处于可见视野内，则视为“已探索”。这会略有漏算 —— 很久以前走过但现在处于迷雾中的陆地
-    # 会被读为未探索 —— 但在此处这是完全良性的偏差：它激励蚁群持续向外探索，而不是过早认定地图已探索完毕。
+    # 会被读为未探索 —— 但在此处这是完全良性的偏差：它激励蚁群持续向外探索，防止过早认定地图已探索完毕。
     visible = b.dilate(b.scatter(obs["mine"]), VIEW_RADIUS2).astype(bool)
     return water, water | visible

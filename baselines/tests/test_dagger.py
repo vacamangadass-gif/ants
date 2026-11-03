@@ -767,7 +767,7 @@ class TestRolloutIntegration:
         out_data = tmp_path / "exp031.jsonl.gz"
         out_run = tmp_path / "runs_exp031"
         argv = [
-            "--base-weights", "runs/exp011/best.pt",
+            "--base-weights", str(ROOT / "runs" / "exp011" / "best.pt"),
             "--base-data", str(base_data),
             "--iterations", "2",
             "--samples-per-iter", "2",
