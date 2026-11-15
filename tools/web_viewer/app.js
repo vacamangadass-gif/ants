@@ -1,5 +1,3 @@
-import { mount } from "/cartridges/ants/viz.js";
-
 const folderSelect = document.getElementById("folder-select");
 const searchInput = document.getElementById("search-input");
 const matchList = document.getElementById("match-list");
@@ -15,6 +13,7 @@ let loadSequence = 0;
 let folderSequence = 0;
 let folderLoadError = "";
 let viewerEngineDigest = "";
+let mountViewer = null;
 
 function showStageMessage(title, { isError = false, details = [] } = {}) {
   stagePlaceholder.innerHTML = "";
@@ -47,22 +46,29 @@ function hideStagePlaceholder() {
 }
 
 async function fetchViewerEngineDigest() {
-  const response = await fetch("/cartridges/ants/engine.json");
+  const response = await fetch("/cartridges/ants/engine.json", { cache: "no-store" });
   if (!response.ok) {
     throw new Error(`HTTP ${response.status} fetching /cartridges/ants/engine.json`);
   }
   const metadata = await response.json();
-  const digest =
-    metadata &&
-    typeof metadata === "object" &&
-    !Array.isArray(metadata) &&
-    typeof metadata.engine_digest === "string"
-      ? metadata.engine_digest.trim()
-      : "";
-  if (!digest) {
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) {
     throw new Error('Missing "engine_digest" field in /cartridges/ants/engine.json');
   }
-  return digest;
+  const rawDigest = metadata.engine_digest;
+  if (rawDigest === undefined || rawDigest === null) {
+    throw new Error('Missing "engine_digest" field in /cartridges/ants/engine.json');
+  }
+  if (typeof rawDigest !== "string") {
+    throw new Error('Invalid "engine_digest" field in /cartridges/ants/engine.json');
+  }
+  const trimmed = rawDigest.trim();
+  if (!trimmed) {
+    throw new Error('Empty "engine_digest" field in /cartridges/ants/engine.json');
+  }
+  if (rawDigest !== trimmed) {
+    throw new Error('Invalid "engine_digest" field in /cartridges/ants/engine.json: unexpected whitespace');
+  }
+  return rawDigest;
 }
 
 function updateUrl(folder, file, pushHistory = true) {
@@ -148,6 +154,9 @@ function destroyCurrentViewer() {
     currentViewer = null;
   }
   stageEl.innerHTML = "";
+  stageEl.className = "";
+  delete stageEl.dataset.tbTheme;
+  delete stageEl.dataset.tbChrome;
 }
 
 async function selectMatch(fileName, pushHistory = true) {
@@ -163,7 +172,7 @@ async function selectMatch(fileName, pushHistory = true) {
 async function loadReplay(folder, file) {
   const currentRequestId = ++loadSequence;
 
-  if (!viewerEngineDigest) {
+  if (!viewerEngineDigest || typeof mountViewer !== "function") {
     destroyCurrentViewer();
     showStageMessage("Failed to initialize replay viewer: missing viewer engine_digest.", {
       isError: true,
@@ -176,7 +185,7 @@ async function loadReplay(folder, file) {
   let replayData;
   try {
     const url = `/api/replay?folder=${encodeURIComponent(folder)}&file=${encodeURIComponent(file)}`;
-    const response = await fetch(url);
+    const response = await fetch(url, { cache: "no-store" });
     if (!response.ok) {
       throw new Error(`Server returned HTTP ${response.status}`);
     }
@@ -209,6 +218,8 @@ async function loadReplay(folder, file) {
       replayDigestDisplay = `(invalid: ${JSON.stringify(rawReplayDigest)})`;
     } else if (trimmedReplayDigest === "") {
       replayDigestDisplay = "(empty)";
+    } else if (rawReplayDigest !== trimmedReplayDigest) {
+      replayDigestDisplay = JSON.stringify(rawReplayDigest);
     } else {
       replayDigestDisplay = rawReplayDigest;
     }
@@ -232,7 +243,7 @@ async function loadReplay(folder, file) {
   hideStagePlaceholder();
 
   try {
-    const viewer = await mount("#replay-stage", replayData, {
+    const viewer = await mountViewer("#replay-stage", replayData, {
       tier: "stage",
       autoplay: false,
       theme: "dark",
@@ -309,11 +320,19 @@ async function selectFolder(folderName, targetFile = null, pushHistory = true) {
 }
 
 async function init() {
+  folderSelect.disabled = true;
+  searchInput.disabled = true;
   showStageMessage("Loading viewer engine metadata...");
   try {
     viewerEngineDigest = await fetchViewerEngineDigest();
+    const vizModule = await import("/cartridges/ants/viz.js");
+    if (!vizModule || typeof vizModule.mount !== "function") {
+      throw new Error('Viewer module /cartridges/ants/viz.js does not export "mount"');
+    }
+    mountViewer = vizModule.mount;
   } catch (err) {
     viewerEngineDigest = "";
+    mountViewer = null;
     const reason = (err && err.message) ? err.message : "Request failed";
     destroyCurrentViewer();
     folderSelect.innerHTML = "";
@@ -333,6 +352,54 @@ async function init() {
     showStageMessage(`Failed to initialize replay viewer: ${reason}`, { isError: true });
     return;
   }
+
+  let directories = [];
+  let dirError = "";
+  try {
+    const response = await fetch("/api/directories", { cache: "no-store" });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    directories = await response.json();
+  } catch (err) {
+    directories = [];
+    dirError = (err && err.message) ? err.message : "Request failed";
+  }
+
+  folderSelect.innerHTML = "";
+  if (dirError) {
+    folderLoadError = dirError;
+    const opt = document.createElement("option");
+    opt.value = "";
+    opt.textContent = "Failed to load folders";
+    folderSelect.appendChild(opt);
+    folderSelect.disabled = true;
+    searchInput.disabled = true;
+    renderMatchList();
+    showStageMessage(`Failed to load replay folders: ${dirError}`, { isError: true });
+    return;
+  }
+  if (directories.length === 0) {
+    const opt = document.createElement("option");
+    opt.value = "";
+    opt.textContent = "No replay folders found";
+    folderSelect.appendChild(opt);
+    folderSelect.disabled = true;
+    searchInput.disabled = true;
+    renderMatchList();
+    showStageMessage("No replay folders found");
+    return;
+  }
+
+  directories.forEach((dir) => {
+    const opt = document.createElement("option");
+    opt.value = dir.folder;
+    opt.textContent = `${dir.name} (${dir.count})`;
+    folderSelect.appendChild(opt);
+  });
+
+  folderSelect.disabled = false;
+  searchInput.disabled = false;
 
   folderSelect.addEventListener("change", async (e) => {
     const newFolder = e.target.value;
@@ -381,47 +448,6 @@ async function init() {
         showStageMessage("Select a match to replay");
       }
     }
-  });
-
-  let directories = [];
-  let dirError = "";
-  try {
-    const response = await fetch("/api/directories");
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
-    }
-    directories = await response.json();
-  } catch (err) {
-    directories = [];
-    dirError = (err && err.message) ? err.message : "Request failed";
-  }
-
-  folderSelect.innerHTML = "";
-  if (dirError) {
-    folderLoadError = dirError;
-    const opt = document.createElement("option");
-    opt.value = "";
-    opt.textContent = "Failed to load folders";
-    folderSelect.appendChild(opt);
-    renderMatchList();
-    showStageMessage(`Failed to load replay folders: ${dirError}`, { isError: true });
-    return;
-  }
-  if (directories.length === 0) {
-    const opt = document.createElement("option");
-    opt.value = "";
-    opt.textContent = "No replay folders found";
-    folderSelect.appendChild(opt);
-    renderMatchList();
-    showStageMessage("No replay folders found");
-    return;
-  }
-
-  directories.forEach((dir) => {
-    const opt = document.createElement("option");
-    opt.value = dir.folder;
-    opt.textContent = `${dir.name} (${dir.count})`;
-    folderSelect.appendChild(opt);
   });
 
   const params = new URLSearchParams(window.location.search);

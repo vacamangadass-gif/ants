@@ -1,3 +1,4 @@
+import hashlib
 import http.client
 import http.server
 import json
@@ -384,6 +385,21 @@ class TestReplayServerAPI(unittest.TestCase):
         engine_meta = json.loads(body_json.decode("utf-8"))
         self.assertIsInstance(engine_meta.get("engine_digest"), str)
         self.assertTrue(engine_meta["engine_digest"].startswith("sha256:"))
+
+        expected_engine_json = self.repo_root / "dist" / "viz" / "engine.json"
+        self.assertEqual(engine_meta, json.loads(expected_engine_json.read_text(encoding="utf-8")))
+
+        wasm_path = self.repo_root / "dist" / "tb-ants.wasm"
+        if wasm_path.exists():
+            wasm_digest = "sha256:" + hashlib.sha256(wasm_path.read_bytes()).hexdigest()
+            self.assertEqual(engine_meta["engine_digest"], wasm_digest)
+
+        status_json_head, headers_json_head, body_json_head = self.fetch(
+            "/cartridges/ants/engine.json", method="HEAD"
+        )
+        self.assertEqual(status_json_head, 200)
+        self.assertEqual(headers_json_head.get("Content-Length"), str(len(body_json)))
+        self.assertEqual(len(body_json_head), 0)
 
         status_missing, _, _ = self.fetch("/cartridges/ants/missing_file.js")
         self.assertEqual(status_missing, 404)
