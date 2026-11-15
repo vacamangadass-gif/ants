@@ -138,6 +138,7 @@ jobs:
             tests/test_adapter_conformance.py \
             tests/test_env.py \
             tests/test_teacher.py \
+            tests/test_adversarial_m1_008.py \
             tests/test_arbitration.py \
             tests/test_chebyshev_clustering_stress.py \
             tests/test_collect_stress.py \
@@ -151,6 +152,7 @@ jobs:
             tests/test_m2_008_it2_torus_challenge.py \
             tests/test_m2_it3_invariant_verification.py \
             tests/test_m3_challenger2_stress.py \
+            tests/test_m3_exp072_empirical_challenge.py \
             tests/test_m3_gen4_empirical_challenger.py \
             tests/test_m3_stress_challenge.py \
             tests/test_mappo.py \

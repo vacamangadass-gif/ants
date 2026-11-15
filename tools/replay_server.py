@@ -47,6 +47,9 @@ class ReplayRequestHandler(http.server.BaseHTTPRequestHandler):
                     self.end_headers()
                     return
                 content = f.read()
+        except FileNotFoundError:
+            self.send_json(404, {"error": "File not found"})
+            return
         except PermissionError:
             self.send_json(403, {"error": "Forbidden: Permission denied"})
             return
@@ -379,6 +382,7 @@ def main():
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nShutting down replay server...")
+    finally:
         server.server_close()
 
 

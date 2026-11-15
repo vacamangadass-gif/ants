@@ -232,13 +232,24 @@ async function init() {
     const targetFolder = popFolder || folderSelect.options[0]?.value || "";
 
     searchInput.value = "";
-    if (targetFolder && targetFolder !== currentFolder) {
+    if (!targetFolder) {
+      renderMatchList();
+      return;
+    }
+    if (targetFolder !== currentFolder) {
       await selectFolder(targetFolder, popFile, false);
     } else {
       renderMatchList();
       if (popFile) {
-        if (popFile !== selectedMatch) {
+        if (!allMatches.includes(popFile)) {
+          loadSequence++;
           folderSequence++;
+          selectedMatch = "";
+          updateActiveItem();
+          destroyCurrentViewer();
+          stagePlaceholder.textContent = `Match file "${popFile}" not found in ${currentFolder}`;
+          stagePlaceholder.style.display = "block";
+        } else if (popFile !== selectedMatch) {
           await selectMatch(popFile, false);
         }
       } else {
@@ -254,16 +265,30 @@ async function init() {
   });
 
   let directories = [];
+  let dirError = "";
   try {
     const response = await fetch("/api/directories");
-    if (response.ok) {
-      directories = await response.json();
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
     }
-  } catch {
+    directories = await response.json();
+  } catch (err) {
     directories = [];
+    dirError = (err && err.message) ? err.message : "Request failed";
   }
 
   folderSelect.innerHTML = "";
+  if (dirError) {
+    folderLoadError = dirError;
+    const opt = document.createElement("option");
+    opt.value = "";
+    opt.textContent = "Failed to load folders";
+    folderSelect.appendChild(opt);
+    renderMatchList();
+    stagePlaceholder.textContent = `Failed to load replay folders: ${dirError}`;
+    stagePlaceholder.style.display = "block";
+    return;
+  }
   if (directories.length === 0) {
     const opt = document.createElement("option");
     opt.value = "";
