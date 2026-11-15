@@ -311,10 +311,13 @@ class TestReplayServerAPI(unittest.TestCase):
                 "/cartridges/ants/..\\etc/passwd",
                 "/cartridges/ants/..\\..\\etc/passwd",
                 "/cartridges/ants/viz.js/.",
+                "/cartridges/ants/viz.js/",
+                "/cartridges/ants/..%2f..%2ftools%2freplay_server.py",
                 "/cartridges/ants/%2e/viz.js",
                 "/cartridges/ants/%252e/viz.js",
                 "/../../etc/passwd",
                 "/%2e%2e/%2e%2e/etc/passwd",
+                "/..%2f..%2fetc%2fpasswd",
                 "/....//etc/passwd",
                 "/%252e%252e%252fetc/passwd",
                 "/..\\etc/passwd",
@@ -353,6 +356,16 @@ class TestReplayServerAPI(unittest.TestCase):
         self.assertIn("application/javascript", headers_viz.get("Content-Type", ""))
         self.assertTrue(int(headers_viz.get("Content-Length", "0")) > 0)
         self.assertEqual(len(body_viz), 0)
+
+        for missing_path in (
+            "/api/matches?folder=missing_folder",
+            "/api/replay?folder=folder_a&file=missing.json",
+            "/cartridges/ants/missing_file.js",
+        ):
+            st_missing, hd_missing, bd_missing = self.fetch(missing_path, method="HEAD")
+            self.assertEqual(st_missing, 404, f"HEAD on missing resource should return 404: {missing_path}")
+            self.assertIn("application/json", hd_missing.get("Content-Type", ""))
+            self.assertEqual(len(bd_missing), 0)
 
     def test_cartridge_static_routing(self):
         status_js, headers_js, body_js = self.fetch("/cartridges/ants/viz.js")
@@ -395,6 +408,10 @@ class TestReplayServerAPI(unittest.TestCase):
 
         status_missing, _, _ = self.fetch("/nonexistent.html")
         self.assertEqual(status_missing, 404)
+
+        status_favicon, headers_favicon, _ = self.fetch("/favicon.ico")
+        self.assertEqual(status_favicon, 404)
+        self.assertIn("application/json", headers_favicon.get("Content-Type", ""))
 
 
 class TestServerProcessLifecycle(unittest.TestCase):

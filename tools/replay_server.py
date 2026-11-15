@@ -2,6 +2,7 @@ import argparse
 import http.server
 import json
 import mimetypes
+import os
 from pathlib import Path
 import typing
 import urllib.parse
@@ -38,7 +39,7 @@ class ReplayRequestHandler(http.server.BaseHTTPRequestHandler):
         try:
             with open(file_path, "rb") as f:
                 if self.command == "HEAD":
-                    file_size = file_path.stat().st_size
+                    file_size = os.fstat(f.fileno()).st_size
                     self.send_response(200)
                     self.send_header("Content-Type", mime_type)
                     self.send_header("Content-Length", str(file_size))

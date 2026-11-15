@@ -13,6 +13,7 @@ let selectedMatch = "";
 let currentViewer = null;
 let loadSequence = 0;
 let folderSequence = 0;
+let folderLoadError = "";
 
 function updateUrl(folder, file, pushHistory = true) {
   const params = new URLSearchParams();
@@ -47,6 +48,15 @@ function renderMatchList() {
     : allMatches;
 
   matchList.innerHTML = "";
+  if (folderLoadError) {
+    matchStats.textContent = "Failed to load matches";
+    const errorLi = document.createElement("li");
+    errorLi.textContent = "Failed to load replay list";
+    errorLi.style.cursor = "default";
+    errorLi.style.color = "#f87171";
+    matchList.appendChild(errorLi);
+    return;
+  }
   if (filtered.length === 0) {
     matchStats.textContent = allMatches.length === 0 ? "0 matches found" : `0 of ${allMatches.length} matches`;
     const emptyLi = document.createElement("li");
@@ -154,6 +164,8 @@ async function selectFolder(folderName, targetFile = null, pushHistory = true) {
   const currentFolderReq = ++folderSequence;
   loadSequence++;
 
+  currentFolder = "";
+  folderLoadError = "";
   folderSelect.value = folderName;
   selectedMatch = "";
   allMatches = [];
@@ -172,6 +184,7 @@ async function selectFolder(folderName, targetFile = null, pushHistory = true) {
   } catch (err) {
     if (currentFolderReq !== folderSequence) return;
     allMatches = [];
+    folderLoadError = err.message || "Request failed";
     renderMatchList();
     destroyCurrentViewer();
     stagePlaceholder.textContent = `Failed to load matches for ${folderName}: ${err.message}`;
@@ -181,6 +194,7 @@ async function selectFolder(folderName, targetFile = null, pushHistory = true) {
 
   if (currentFolderReq !== folderSequence) return;
 
+  folderLoadError = "";
   currentFolder = folderName;
   allMatches = data;
   renderMatchList();
@@ -215,10 +229,11 @@ async function init() {
     const params = new URLSearchParams(window.location.search);
     const popFolder = params.get("folder");
     const popFile = params.get("file");
+    const targetFolder = popFolder || folderSelect.options[0]?.value || "";
 
     searchInput.value = "";
-    if (popFolder && popFolder !== currentFolder) {
-      await selectFolder(popFolder, popFile, false);
+    if (targetFolder && targetFolder !== currentFolder) {
+      await selectFolder(targetFolder, popFile, false);
     } else {
       renderMatchList();
       if (popFile) {
@@ -273,8 +288,9 @@ async function init() {
 
   const matchingDir = directories.find((d) => d.folder === initialFolder);
   const folderToLoad = matchingDir ? matchingDir.folder : directories[0].folder;
+  const fileToLoad = (!initialFolder || matchingDir) ? initialFile : null;
 
-  await selectFolder(folderToLoad, initialFile, false);
+  await selectFolder(folderToLoad, fileToLoad, false);
 }
 
 init();
