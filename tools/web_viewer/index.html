@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ants Match Replay Console</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body style="margin: 0; padding: 0; width: 100vw; height: 100vh; overflow: hidden; background-color: #0b0f19;">
+  <div id="replay-console">
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <div class="header-title">
+          <span>Ants Replay Console</span>
+        </div>
+        <div class="field-group">
+          <label class="field-label" for="folder-select">Model Folder</label>
+          <select id="folder-select">
+            <option value="" disabled selected>Loading folders...</option>
+          </select>
+        </div>
+        <div class="field-group">
+          <label class="field-label" for="search-input">Search Matches</label>
+          <input id="search-input" type="search" placeholder="Filter by match name...">
+        </div>
+        <div id="match-stats" class="match-stats">0 matches found</div>
+      </div>
+      <div class="match-list-container">
+        <ul id="match-list"></ul>
+      </div>
+    </aside>
+    <main class="stage-container">
+      <div id="replay-stage"></div>
+      <div id="stage-placeholder" class="stage-placeholder">Select a match to replay</div>
+    </main>
+  </div>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

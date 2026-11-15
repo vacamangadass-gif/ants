@@ -1,0 +1,225 @@
+import { mount } from "/cartridges/ants/viz.js";
+
+const folderSelect = document.getElementById("folder-select");
+const searchInput = document.getElementById("search-input");
+const matchList = document.getElementById("match-list");
+const matchStats = document.getElementById("match-stats");
+const stageContainer = document.getElementById("replay-stage");
+const stagePlaceholder = document.getElementById("stage-placeholder");
+
+let currentFolder = "";
+let allMatches = [];
+let selectedMatch = "";
+let currentViewer = null;
+let loadSequence = 0;
+
+function updateUrl(folder, file) {
+  const params = new URLSearchParams();
+  if (folder) params.set("folder", folder);
+  if (file) params.set("file", file);
+  const newUrl = `${window.location.pathname}?${params.toString()}`;
+  if (window.location.search !== `?${params.toString()}`) {
+    window.history.pushState({ folder, file }, "", newUrl);
+  }
+}
+
+function updateActiveItem() {
+  const items = matchList.querySelectorAll("li");
+  items.forEach((item) => {
+    if (item.dataset.fileName === selectedMatch) {
+      item.classList.add("active");
+    } else {
+      item.classList.remove("active");
+    }
+  });
+}
+
+function renderMatchList() {
+  const query = searchInput.value.trim().toLowerCase();
+  const filtered = query
+    ? allMatches.filter((name) => name.toLowerCase().includes(query))
+    : allMatches;
+
+  matchList.innerHTML = "";
+  if (filtered.length === 0) {
+    matchStats.textContent = allMatches.length === 0 ? "0 matches found" : `0 of ${allMatches.length} matches`;
+    const emptyLi = document.createElement("li");
+    emptyLi.textContent = allMatches.length === 0 ? "No replay files found" : "No matches match search";
+    emptyLi.style.cursor = "default";
+    emptyLi.style.color = "#64748b";
+    matchList.appendChild(emptyLi);
+    return;
+  }
+
+  matchStats.textContent = query
+    ? `${filtered.length} of ${allMatches.length} matches`
+    : `${filtered.length} matches found`;
+
+  filtered.forEach((fileName) => {
+    const li = document.createElement("li");
+    li.dataset.fileName = fileName;
+    li.textContent = fileName;
+    if (fileName === selectedMatch) {
+      li.classList.add("active");
+    }
+    li.addEventListener("click", () => {
+      if (selectedMatch === fileName && currentViewer) {
+        return;
+      }
+      selectMatch(fileName);
+    });
+    matchList.appendChild(li);
+  });
+}
+
+async function selectMatch(fileName) {
+  selectedMatch = fileName;
+  updateActiveItem();
+  updateUrl(currentFolder, selectedMatch);
+  await loadReplay(currentFolder, selectedMatch);
+}
+
+async function loadReplay(folder, file) {
+  const currentRequestId = ++loadSequence;
+
+  stagePlaceholder.textContent = `Loading ${file}...`;
+  stagePlaceholder.style.display = "block";
+
+  let replayData;
+  try {
+    const url = `/api/replay?folder=${encodeURIComponent(folder)}&file=${encodeURIComponent(file)}`;
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`Server returned HTTP ${response.status}`);
+    }
+    replayData = await response.json();
+  } catch (err) {
+    if (currentRequestId !== loadSequence) return;
+    stagePlaceholder.textContent = `Failed to load match: ${err.message}`;
+    stagePlaceholder.style.display = "block";
+    return;
+  }
+
+  if (currentRequestId !== loadSequence) {
+    return;
+  }
+
+  if (currentViewer) {
+    try {
+      currentViewer.destroy();
+    } catch {
+      // 忽略清理异常
+    }
+    currentViewer = null;
+  }
+
+  stageContainer.innerHTML = "";
+  stagePlaceholder.style.display = "none";
+
+  try {
+    currentViewer = await mount("#replay-stage", replayData, {
+      tier: "stage",
+      autoplay: false,
+    });
+  } catch (err) {
+    if (currentRequestId !== loadSequence) return;
+    stagePlaceholder.textContent = `Error mounting viewer: ${err.message}`;
+    stagePlaceholder.style.display = "block";
+  }
+}
+
+async function selectFolder(folderName, targetFile = null) {
+  currentFolder = folderName;
+  folderSelect.value = folderName;
+
+  try {
+    const response = await fetch(`/api/matches?folder=${encodeURIComponent(folderName)}`);
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    allMatches = await response.json();
+  } catch {
+    allMatches = [];
+  }
+
+  renderMatchList();
+
+  if (targetFile && allMatches.includes(targetFile)) {
+    await selectMatch(targetFile);
+  } else if (!targetFile) {
+    selectedMatch = "";
+    if (currentViewer) {
+      try {
+        currentViewer.destroy();
+      } catch {
+        // 忽略清理异常
+      }
+      currentViewer = null;
+    }
+    stageContainer.innerHTML = "";
+    stagePlaceholder.textContent = "Select a match to replay";
+    stagePlaceholder.style.display = "block";
+    updateUrl(currentFolder, "");
+  }
+}
+
+async function init() {
+  folderSelect.addEventListener("change", async (e) => {
+    const newFolder = e.target.value;
+    searchInput.value = "";
+    await selectFolder(newFolder);
+  });
+
+  searchInput.addEventListener("input", () => {
+    renderMatchList();
+  });
+
+  window.addEventListener("popstate", async () => {
+    const params = new URLSearchParams(window.location.search);
+    const popFolder = params.get("folder");
+    const popFile = params.get("file");
+
+    if (popFolder && popFolder !== currentFolder) {
+      await selectFolder(popFolder, popFile);
+    } else if (popFile && popFile !== selectedMatch) {
+      await selectMatch(popFile);
+    }
+  });
+
+  let directories = [];
+  try {
+    const response = await fetch("/api/directories");
+    if (response.ok) {
+      directories = await response.json();
+    }
+  } catch {
+    directories = [];
+  }
+
+  folderSelect.innerHTML = "";
+  if (directories.length === 0) {
+    const opt = document.createElement("option");
+    opt.value = "";
+    opt.textContent = "No replay folders found";
+    folderSelect.appendChild(opt);
+    return;
+  }
+
+  directories.forEach((dir) => {
+    const opt = document.createElement("option");
+    opt.value = dir.folder;
+    opt.textContent = `${dir.name} (${dir.count})`;
+    folderSelect.appendChild(opt);
+  });
+
+  const params = new URLSearchParams(window.location.search);
+  const initialFolder = params.get("folder");
+  const initialFile = params.get("file");
+
+  const matchingDir = directories.find((d) => d.folder === initialFolder);
+  const folderToLoad = matchingDir ? matchingDir.folder : directories[0].folder;
+
+  await selectFolder(folderToLoad, initialFile);
+}
+
+init();
