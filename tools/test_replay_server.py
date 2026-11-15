@@ -339,6 +339,21 @@ class TestReplayServerAPI(unittest.TestCase):
         self.assertIn("text/html", headers_root.get("Content-Type", ""))
         self.assertEqual(len(body_root), 0)
 
+        # 校验静态资源与回放文件的 HEAD 请求返回准确 Content-Length 且不传输正文
+        status_get, _, body_get = self.fetch("/api/replay?folder=folder_a&file=match1.json")
+        status_replay, headers_replay, body_replay = self.fetch(
+            "/api/replay?folder=folder_a&file=match1.json", method="HEAD"
+        )
+        self.assertEqual(status_replay, 200)
+        self.assertEqual(headers_replay.get("Content-Length"), str(len(body_get)))
+        self.assertEqual(len(body_replay), 0)
+
+        status_viz, headers_viz, body_viz = self.fetch("/cartridges/ants/viz.js", method="HEAD")
+        self.assertEqual(status_viz, 200)
+        self.assertIn("application/javascript", headers_viz.get("Content-Type", ""))
+        self.assertTrue(int(headers_viz.get("Content-Length", "0")) > 0)
+        self.assertEqual(len(body_viz), 0)
+
     def test_cartridge_static_routing(self):
         status_js, headers_js, body_js = self.fetch("/cartridges/ants/viz.js")
         self.assertEqual(status_js, 200)

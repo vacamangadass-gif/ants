@@ -129,11 +129,20 @@ async function loadReplay(folder, file) {
   stagePlaceholder.style.display = "none";
 
   try {
-    currentViewer = await mount("#replay-stage", replayData, {
+    const viewer = await mount("#replay-stage", replayData, {
       tier: "stage",
       autoplay: false,
       theme: "dark",
     });
+    if (currentRequestId !== loadSequence) {
+      try {
+        viewer.destroy();
+      } catch {
+        // 清理已作废实例
+      }
+      return;
+    }
+    currentViewer = viewer;
   } catch (err) {
     if (currentRequestId !== loadSequence) return;
     stagePlaceholder.textContent = `Error mounting viewer: ${err.message}`;
@@ -245,6 +254,9 @@ async function init() {
     opt.value = "";
     opt.textContent = "No replay folders found";
     folderSelect.appendChild(opt);
+    renderMatchList();
+    stagePlaceholder.textContent = "No replay folders found";
+    stagePlaceholder.style.display = "block";
     return;
   }
 
