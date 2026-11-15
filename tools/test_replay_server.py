@@ -23,10 +23,15 @@ def find_free_port() -> int:
 
 
 def remove_directory_recursive(target_dir: Path):
-    if not target_dir.exists():
+    if not target_dir.exists() and not target_dir.is_symlink():
+        return
+    if target_dir.is_symlink():
+        target_dir.unlink()
         return
     for item in target_dir.iterdir():
-        if item.is_dir():
+        if item.is_symlink():
+            item.unlink()
+        elif item.is_dir():
             remove_directory_recursive(item)
         else:
             item.unlink()
@@ -39,6 +44,7 @@ class TestReplayServerAPI(unittest.TestCase):
     server_port: int = 0
     base_url: str = ""
     test_replays_dir: Path = None
+    external_dir: Path = None
     repo_root: Path = None
 
     @classmethod
@@ -48,11 +54,17 @@ class TestReplayServerAPI(unittest.TestCase):
         remove_directory_recursive(cls.test_replays_dir)
         cls.test_replays_dir.mkdir(parents=True, exist_ok=True)
 
+        cls.external_dir = cls.repo_root / "target" / "test_external_dir"
+        remove_directory_recursive(cls.external_dir)
+        cls.external_dir.mkdir(parents=True, exist_ok=True)
+        (cls.external_dir / "external_match.json").write_text(json.dumps({"external": True}))
+
         folder_a = cls.test_replays_dir / "folder_a"
         folder_a.mkdir(parents=True, exist_ok=True)
         (folder_a / "match1.json").write_text(json.dumps({"game": "ants", "id": 1}))
         (folder_a / "match2.json").write_text(json.dumps({"game": "ants", "id": 2}))
         (folder_a / "notes.txt").write_text("not a replay")
+        (folder_a / "outside_file_link.json").symlink_to(cls.external_dir / "external_match.json")
 
         folder_b = cls.test_replays_dir / "folder_b"
         folder_b.mkdir(parents=True, exist_ok=True)
@@ -64,6 +76,8 @@ class TestReplayServerAPI(unittest.TestCase):
         hidden_folder = cls.test_replays_dir / ".hidden_folder"
         hidden_folder.mkdir(parents=True, exist_ok=True)
         (hidden_folder / "hidden.json").write_text(json.dumps({"game": "ants"}))
+
+        (cls.test_replays_dir / "outside_folder_link").symlink_to(cls.external_dir, target_is_directory=True)
 
         viz_dir = cls.repo_root / "dist" / "viz"
         web_viewer_dir = cls.repo_root / "tools" / "web_viewer"
@@ -85,6 +99,8 @@ class TestReplayServerAPI(unittest.TestCase):
         if cls.server_thread:
             cls.server_thread.join()
         remove_directory_recursive(cls.test_replays_dir)
+        if hasattr(cls, "external_dir") and cls.external_dir is not None:
+            remove_directory_recursive(cls.external_dir)
 
     def fetch(self, path: str):
         url = f"{self.base_url}{path}"
@@ -104,6 +120,11 @@ class TestReplayServerAPI(unittest.TestCase):
         self.assertIsInstance(data, list)
         self.assertEqual(len(data), 2)
 
+        dir_names = [d["name"] for d in data]
+        self.assertNotIn("outside_folder_link", dir_names)
+        self.assertNotIn(".hidden_folder", dir_names)
+        self.assertNotIn("empty_folder", dir_names)
+
         self.assertEqual(data[0]["folder"], "folder_a")
         self.assertEqual(data[0]["name"], "folder_a")
         self.assertEqual(data[0]["count"], 2)
@@ -119,6 +140,8 @@ class TestReplayServerAPI(unittest.TestCase):
 
         matches = json.loads(body.decode("utf-8"))
         self.assertEqual(matches, ["match1.json", "match2.json"])
+        self.assertNotIn("outside_file_link.json", matches)
+        self.assertNotIn("notes.txt", matches)
 
     def test_matches_error_cases(self):
         status_missing, _, _ = self.fetch("/api/matches")
@@ -164,10 +187,24 @@ class TestReplayServerAPI(unittest.TestCase):
             "/api/matches?folder=%2e%2e",
             "/api/matches?folder=/etc",
             "/api/matches?folder=.",
+            "/api/matches?folder=....//",
+            "/api/matches?folder=%252e%252e%252f",
+            "/api/matches?folder=..\\\\",
+            "/api/matches?folder=..\\\\..\\\\",
+            "/api/matches?folder=outside_folder_link",
             "/api/replay?folder=..&file=match1.json",
+            "/api/replay?folder=....//&file=match1.json",
+            "/api/replay?folder=%252e%252e%252f&file=match1.json",
+            "/api/replay?folder=..\\\\&file=match1.json",
+            "/api/replay?folder=..\\\\..\\\\&file=match1.json",
+            "/api/replay?folder=outside_folder_link&file=external_match.json",
             "/api/replay?folder=folder_a&file=../../etc/passwd",
             "/api/replay?folder=folder_a&file=/etc/passwd",
             "/api/replay?folder=folder_a&file=%2e%2e%2f%2e%2e%2fetc%2fpasswd",
+            "/api/replay?folder=folder_a&file=%252e%252e%252fetc%2fpasswd",
+            "/api/replay?folder=folder_a&file=....//etc/passwd",
+            "/api/replay?folder=folder_a&file=..\\\\etc/passwd",
+            "/api/replay?folder=folder_a&file=outside_file_link.json",
             "/api/replay?folder=/etc&file=passwd",
         ]
         for path in traversal_query_cases:
@@ -178,8 +215,16 @@ class TestReplayServerAPI(unittest.TestCase):
         raw_traversal_paths = [
             "/cartridges/ants/../../tools/replay_server.py",
             "/cartridges/ants/%2e%2e/%2e%2e/tools/replay_server.py",
+            "/cartridges/ants/....//etc/passwd",
+            "/cartridges/ants/%252e%252e%252fetc/passwd",
+            "/cartridges/ants/..\\etc/passwd",
+            "/cartridges/ants/..\\..\\etc/passwd",
             "/../../etc/passwd",
             "/%2e%2e/%2e%2e/etc/passwd",
+            "/....//etc/passwd",
+            "/%252e%252e%252fetc/passwd",
+            "/..\\etc/passwd",
+            "/..\\..\\etc/passwd",
         ]
         for raw_path in raw_traversal_paths:
             conn.request("GET", raw_path)

@@ -48,6 +48,8 @@ class ReplayRequestHandler(http.server.BaseHTTPRequestHandler):
         for part in parts:
             if not part or "\0" in part:
                 return False, None
+            if "\\" in part or "%" in part or ".." in part or "..." in part:
+                return False, None
             p = Path(part)
             if p.is_absolute():
                 return False, None
@@ -80,9 +82,17 @@ class ReplayRequestHandler(http.server.BaseHTTPRequestHandler):
     def handle_api(self, path: str, query: dict):
         if path == "/api/directories":
             dirs = []
+            replays_resolved = self.replays_dir.resolve()
             for item in self.replays_dir.iterdir():
                 if item.is_dir() and not item.name.startswith("."):
-                    count = sum(1 for f in item.iterdir() if f.is_file() and f.name.endswith(".json"))
+                    item_resolved = item.resolve()
+                    if not item_resolved.is_relative_to(replays_resolved) or item_resolved == replays_resolved:
+                        continue
+                    count = sum(
+                        1
+                        for f in item.iterdir()
+                        if f.is_file() and f.name.endswith(".json") and f.resolve().is_relative_to(replays_resolved)
+                    )
                     if count > 0:
                         dirs.append({"name": item.name, "folder": item.name, "count": count})
             dirs.sort(key=lambda d: d["name"])
@@ -104,7 +114,15 @@ class ReplayRequestHandler(http.server.BaseHTTPRequestHandler):
                 self.send_json(404, {"error": "Directory not found"})
                 return
 
-            matches = sorted([f.name for f in target_dir.iterdir() if f.is_file() and f.name.endswith(".json")])
+            matches = sorted(
+                [
+                    f.name
+                    for f in target_dir.iterdir()
+                    if f.is_file()
+                    and f.name.endswith(".json")
+                    and f.resolve().is_relative_to(self.replays_dir.resolve())
+                ]
+            )
             self.send_json(200, matches)
             return
 
@@ -156,7 +174,7 @@ class ReplayRequestHandler(http.server.BaseHTTPRequestHandler):
             return
 
         safe, target_file = self.is_safe_subpath(self.viz_dir, subpath)
-        if not safe:
+        if not safe or target_file == self.viz_dir.resolve():
             self.send_json(403, {"error": "Forbidden: Path traversal detected"})
             return
 
@@ -179,7 +197,7 @@ class ReplayRequestHandler(http.server.BaseHTTPRequestHandler):
             subpath = path.lstrip("/")
 
         safe, target_file = self.is_safe_subpath(self.web_viewer_dir, subpath)
-        if not safe:
+        if not safe or target_file == self.web_viewer_dir.resolve():
             self.send_json(403, {"error": "Forbidden: Path traversal detected"})
             return
 
