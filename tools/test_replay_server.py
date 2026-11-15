@@ -2,8 +2,8 @@ import http.client
 import http.server
 import json
 from pathlib import Path
+import re
 import shutil
-import socket
 import subprocess
 import sys
 import threading
@@ -16,12 +16,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from replay_server import create_handler_class
 
 
-def find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
 class TestReplayServerAPI(unittest.TestCase):
     server: http.server.ThreadingHTTPServer = None
     server_thread: threading.Thread = None
@@ -29,7 +23,8 @@ class TestReplayServerAPI(unittest.TestCase):
     base_url: str = ""
     test_replays_dir: Path = None
     external_dir: Path = None
-    test_viz_dir: Path = None
+    locked_dir: Path = None
+    locked_file: Path = None
     repo_root: Path = None
 
     @classmethod
@@ -53,6 +48,11 @@ class TestReplayServerAPI(unittest.TestCase):
         (folder_a / "notes.txt").write_text("not a replay")
         (folder_a / "outside_file_link.json").symlink_to(cls.external_dir / "external_match.json")
 
+        # 权限 0o000 不可读文件
+        cls.locked_file = folder_a / "locked.json"
+        cls.locked_file.write_text(json.dumps({"game": "ants", "locked": True}))
+        cls.locked_file.chmod(0o000)
+
         folder_b = cls.test_replays_dir / "folder_b"
         folder_b.mkdir(parents=True, exist_ok=True)
         (folder_b / "final.json").write_text(json.dumps({"game": "ants", "winner": 0}))
@@ -69,20 +69,28 @@ class TestReplayServerAPI(unittest.TestCase):
 
         (cls.test_replays_dir / "outside_folder_link").symlink_to(cls.external_dir, target_is_directory=True)
 
-        # 准备 viz 测试目录：若仓库中已有 dist/viz 则直接复用，否则自动构建独立测试桩
+        # 权限 0o000 不可读目录
+        cls.locked_dir = cls.test_replays_dir / "locked_dir"
+        cls.locked_dir.mkdir(parents=True, exist_ok=True)
+        (cls.locked_dir / "inside.json").write_text(json.dumps({"game": "ants", "secret": True}))
+        cls.locked_dir.chmod(0o000)
+
+        # 包含相互指向与自指向的符号链接环路目录
+        loop_dir = cls.test_replays_dir / "loop_dir"
+        loop_dir.mkdir(parents=True, exist_ok=True)
+        (loop_dir / "valid.json").write_text(json.dumps({"game": "ants", "valid": True}))
+        (loop_dir / "loop_a.json").symlink_to(loop_dir / "loop_b.json")
+        (loop_dir / "loop_b.json").symlink_to(loop_dir / "loop_a.json")
+        (loop_dir / "self_loop.json").symlink_to(loop_dir / "self_loop.json")
+
+        # 检查真实构建产物 dist/viz 必须存在
         real_viz_dir = cls.repo_root / "dist" / "viz"
-        if real_viz_dir.exists() and (real_viz_dir / "viz.js").exists():
-            viz_dir = real_viz_dir
-        else:
-            cls.test_viz_dir = cls.repo_root / "target" / "test_viz"
-            shutil.rmtree(cls.test_viz_dir, ignore_errors=True)
-            cls.test_viz_dir.mkdir(parents=True, exist_ok=True)
-            (cls.test_viz_dir / "viz.js").write_text("// test viz.js")
-            (cls.test_viz_dir / "engine.json").write_text("{}")
-            engine_dir = cls.test_viz_dir / "engine"
-            engine_dir.mkdir(parents=True, exist_ok=True)
-            (engine_dir / "tb-ants.core.wasm").write_bytes(b"\x00asm\x01\x00\x00\x00")
-            viz_dir = cls.test_viz_dir
+        if not real_viz_dir.exists() or not (real_viz_dir / "viz.js").exists():
+            raise FileNotFoundError(
+                f"Missing required build artifact directory: {real_viz_dir}. "
+                "Please run './build.sh' and 'viz/build.sh' before running replay server tests."
+            )
+        viz_dir = real_viz_dir
 
         web_viewer_dir = cls.repo_root / "tools" / "web_viewer"
 
@@ -102,11 +110,22 @@ class TestReplayServerAPI(unittest.TestCase):
             cls.server.server_close()
         if cls.server_thread:
             cls.server_thread.join()
+
+        # 恢复权限后删除测试目录
+        if hasattr(cls, "locked_dir") and cls.locked_dir is not None and cls.locked_dir.exists():
+            try:
+                cls.locked_dir.chmod(0o755)
+            except OSError:
+                pass
+        if hasattr(cls, "locked_file") and cls.locked_file is not None and cls.locked_file.exists():
+            try:
+                cls.locked_file.chmod(0o644)
+            except OSError:
+                pass
+
         shutil.rmtree(cls.test_replays_dir, ignore_errors=True)
         if hasattr(cls, "external_dir") and cls.external_dir is not None:
             shutil.rmtree(cls.external_dir, ignore_errors=True)
-        if hasattr(cls, "test_viz_dir") and cls.test_viz_dir is not None:
-            shutil.rmtree(cls.test_viz_dir, ignore_errors=True)
 
     def fetch(self, path: str, method: str = "GET"):
         url = f"{self.base_url}{path}"
@@ -124,21 +143,26 @@ class TestReplayServerAPI(unittest.TestCase):
 
         data = json.loads(body.decode("utf-8"))
         self.assertIsInstance(data, list)
-        self.assertEqual(len(data), 2)
 
         dir_names = [d["name"] for d in data]
         self.assertNotIn("outside_folder_link", dir_names)
         self.assertNotIn(".hidden_folder", dir_names)
         self.assertNotIn("empty_folder", dir_names)
+        self.assertNotIn("locked_dir", dir_names)
 
-        self.assertEqual(data[0]["folder"], "folder_a")
-        self.assertEqual(data[0]["name"], "folder_a")
-        # match1.json, match2.json, match.1..2.json, win_50%.json (不计 notes.txt、外部软链接与跨目录软链接)
-        self.assertEqual(data[0]["count"], 4)
+        self.assertIn("folder_a", dir_names)
+        self.assertIn("folder_b", dir_names)
+        self.assertIn("loop_dir", dir_names)
 
-        self.assertEqual(data[1]["folder"], "folder_b")
-        self.assertEqual(data[1]["name"], "folder_b")
-        self.assertEqual(data[1]["count"], 1)
+        folder_a_data = next(d for d in data if d["name"] == "folder_a")
+        # 包含 match1.json, match2.json, match.1..2.json, win_50%.json, locked.json
+        self.assertEqual(folder_a_data["count"], 5)
+
+        folder_b_data = next(d for d in data if d["name"] == "folder_b")
+        self.assertEqual(folder_b_data["count"], 1)
+
+        loop_dir_data = next(d for d in data if d["name"] == "loop_dir")
+        self.assertEqual(loop_dir_data["count"], 1)
 
     def test_matches_listing(self):
         status, headers, body = self.fetch("/api/matches?folder=folder_a")
@@ -146,7 +170,7 @@ class TestReplayServerAPI(unittest.TestCase):
         self.assertIn("application/json", headers.get("Content-Type", ""))
 
         matches = json.loads(body.decode("utf-8"))
-        self.assertEqual(matches, ["match.1..2.json", "match1.json", "match2.json", "win_50%.json"])
+        self.assertEqual(matches, ["locked.json", "match.1..2.json", "match1.json", "match2.json", "win_50%.json"])
         self.assertNotIn("outside_file_link.json", matches)
         self.assertNotIn("cross_folder_link.json", matches)
         self.assertNotIn("notes.txt", matches)
@@ -205,6 +229,41 @@ class TestReplayServerAPI(unittest.TestCase):
         status_cross, _, _ = self.fetch("/api/replay?folder=folder_a&file=cross_folder_link.json")
         self.assertEqual(status_cross, 403)
 
+    def test_unreadable_file_and_directory(self):
+        # 0o000 权限不可读文件请求
+        status_get, headers_get, body_get = self.fetch("/api/replay?folder=folder_a&file=locked.json")
+        self.assertEqual(status_get, 403)
+        self.assertIn("application/json", headers_get.get("Content-Type", ""))
+        self.assertIn(b"Permission denied", body_get)
+
+        status_head, headers_head, body_head = self.fetch(
+            "/api/replay?folder=folder_a&file=locked.json", method="HEAD"
+        )
+        self.assertEqual(status_head, 403)
+        self.assertEqual(len(body_head), 0)
+
+        # 0o000 权限不可读目录请求
+        status_matches, _, _ = self.fetch("/api/matches?folder=locked_dir")
+        self.assertEqual(status_matches, 403)
+
+        status_replay_locked_dir, _, _ = self.fetch("/api/replay?folder=locked_dir&file=inside.json")
+        self.assertEqual(status_replay_locked_dir, 403)
+
+    def test_symlink_loop_handling(self):
+        # 包含循环软链接时 matches 接口应安全跳过循环链接
+        status_matches, _, body_matches = self.fetch("/api/matches?folder=loop_dir")
+        self.assertEqual(status_matches, 200)
+        matches = json.loads(body_matches.decode("utf-8"))
+        self.assertIn("valid.json", matches)
+        self.assertNotIn("loop_a.json", matches)
+        self.assertNotIn("loop_b.json", matches)
+        self.assertNotIn("self_loop.json", matches)
+
+        # 针对循环软链接文件的 replay 请求应返回 403
+        status_replay, _, body_replay = self.fetch("/api/replay?folder=loop_dir&file=loop_a.json")
+        self.assertEqual(status_replay, 403)
+        self.assertIn(b"Forbidden: Path traversal detected", body_replay)
+
     def test_path_traversal_defense(self):
         traversal_query_cases = [
             "/api/matches?folder=..",
@@ -217,12 +276,16 @@ class TestReplayServerAPI(unittest.TestCase):
             "/api/matches?folder=..\\\\",
             "/api/matches?folder=..\\\\..\\\\",
             "/api/matches?folder=outside_folder_link",
+            "/api/matches?folder=%2e",
+            "/api/matches?folder=%252e",
             "/api/replay?folder=..&file=match1.json",
             "/api/replay?folder=....//&file=match1.json",
             "/api/replay?folder=%252e%252e%252f&file=match1.json",
             "/api/replay?folder=..\\\\&file=match1.json",
             "/api/replay?folder=..\\\\..\\\\&file=match1.json",
             "/api/replay?folder=outside_folder_link&file=external_match.json",
+            "/api/replay?folder=%2e&file=match1.json",
+            "/api/replay?folder=%252e&file=match1.json",
             "/api/replay?folder=folder_a&file=../../etc/passwd",
             "/api/replay?folder=folder_a&file=/etc/passwd",
             "/api/replay?folder=folder_a&file=%2e%2e%2f%2e%2e%2fetc%2fpasswd",
@@ -230,6 +293,8 @@ class TestReplayServerAPI(unittest.TestCase):
             "/api/replay?folder=folder_a&file=....//etc/passwd",
             "/api/replay?folder=folder_a&file=..\\\\etc/passwd",
             "/api/replay?folder=folder_a&file=outside_file_link.json",
+            "/api/replay?folder=folder_a&file=%2e",
+            "/api/replay?folder=folder_a&file=%252e",
             "/api/replay?folder=/etc&file=passwd",
         ]
         for path in traversal_query_cases:
@@ -245,6 +310,9 @@ class TestReplayServerAPI(unittest.TestCase):
                 "/cartridges/ants/%252e%252e%252fetc/passwd",
                 "/cartridges/ants/..\\etc/passwd",
                 "/cartridges/ants/..\\..\\etc/passwd",
+                "/cartridges/ants/viz.js/.",
+                "/cartridges/ants/%2e/viz.js",
+                "/cartridges/ants/%252e/viz.js",
                 "/../../etc/passwd",
                 "/%2e%2e/%2e%2e/etc/passwd",
                 "/....//etc/passwd",
@@ -326,17 +394,30 @@ class TestServerProcessLifecycle(unittest.TestCase):
         sample_folder.mkdir(parents=True, exist_ok=True)
         (sample_folder / "test.json").write_text(json.dumps({"ok": True}))
 
-        free_port = find_free_port()
+        real_viz_dir = repo_root / "dist" / "viz"
+        if not real_viz_dir.exists() or not (real_viz_dir / "viz.js").exists():
+            raise FileNotFoundError(
+                f"Missing required build artifact directory: {real_viz_dir}. "
+                "Please run './build.sh' and 'viz/build.sh' before running replay server tests."
+            )
+
         cmd = [
             sys.executable,
+            "-u",
             str(repo_root / "tools" / "replay_server.py"),
             "--port",
-            str(free_port),
+            "0",
             "--replays",
             str(test_dir),
         ]
 
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
 
         def cleanup_process():
             if proc.poll() is None:
@@ -353,7 +434,22 @@ class TestServerProcessLifecycle(unittest.TestCase):
 
         self.addCleanup(cleanup_process)
 
-        url = f"http://127.0.0.1:{free_port}/api/directories"
+        actual_port = None
+        start_time = time.time()
+        while time.time() - start_time < 5.0:
+            if proc.poll() is not None:
+                break
+            line = proc.stdout.readline()
+            if "listening on http://" in line:
+                match = re.search(r":(\d+)/", line)
+                if match:
+                    actual_port = int(match.group(1))
+                    break
+            time.sleep(0.05)
+
+        self.assertIsNotNone(actual_port, "Replay server did not output listening port.")
+
+        url = f"http://127.0.0.1:{actual_port}/api/directories"
         connected = False
         start_time = time.time()
         while time.time() - start_time < 5.0:

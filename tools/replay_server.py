@@ -23,7 +23,6 @@ class ReplayRequestHandler(http.server.BaseHTTPRequestHandler):
     replays_dir: Path = Path("replays")
     viz_dir: Path = Path("dist/viz")
     web_viewer_dir: Path = Path("tools/web_viewer")
-    allowed_host: str = "127.0.0.1"
 
     def send_json(self, status_code: int, payload: typing.Any):
         data = json.dumps(payload).encode("utf-8")
@@ -36,14 +35,30 @@ class ReplayRequestHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(data)
 
     def send_file(self, file_path: Path, mime_type: str):
-        content = file_path.read_bytes()
+        try:
+            with open(file_path, "rb") as f:
+                if self.command == "HEAD":
+                    file_size = file_path.stat().st_size
+                    self.send_response(200)
+                    self.send_header("Content-Type", mime_type)
+                    self.send_header("Content-Length", str(file_size))
+                    self.send_header("Cache-Control", "no-cache")
+                    self.end_headers()
+                    return
+                content = f.read()
+        except PermissionError:
+            self.send_json(403, {"error": "Forbidden: Permission denied"})
+            return
+        except OSError:
+            self.send_json(500, {"error": "Failed to read file"})
+            return
+
         self.send_response(200)
         self.send_header("Content-Type", mime_type)
         self.send_header("Content-Length", str(len(content)))
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
-        if self.command != "HEAD":
-            self.wfile.write(content)
+        self.wfile.write(content)
 
     def send_static_file(self, target_file: Path, default_mime: str = "application/octet-stream"):
         suffix = target_file.suffix.lower()
@@ -58,21 +73,25 @@ class ReplayRequestHandler(http.server.BaseHTTPRequestHandler):
             if not part or "\0" in part or "\\" in part:
                 return False, None
             curr = part
-            unquoted = urllib.parse.unquote(curr)
-            while unquoted != curr:
-                if "\0" in unquoted or "\\" in unquoted:
-                    return False, None
-                for seg in Path(unquoted).parts:
-                    if seg == "." or (len(seg) >= 2 and all(c == "." for c in seg)):
-                        return False, None
-                curr = unquoted
+            while True:
                 unquoted = urllib.parse.unquote(curr)
+                if unquoted == curr:
+                    break
+                if not unquoted or "\0" in unquoted or "\\" in unquoted:
+                    return False, None
+                curr = unquoted
+
+            if curr.startswith("/") or curr.endswith("/"):
+                return False, None
+
+            for seg in curr.split("/"):
+                if not seg or seg == "." or seg == ".." or all(c == "." for c in seg) or seg.startswith("."):
+                    return False, None
+
             p = Path(part)
             if p.is_absolute():
                 return False, None
-            for seg in p.parts:
-                if seg == "." or (len(seg) >= 2 and all(c == "." for c in seg)):
-                    return False, None
+
         combined = base_dir
         for part in parts:
             combined = combined / part
@@ -89,18 +108,16 @@ class ReplayRequestHandler(http.server.BaseHTTPRequestHandler):
         if not name or "\0" in name or "/" in name or "\\" in name:
             return False
         curr = name
-        unquoted = urllib.parse.unquote(curr)
-        while unquoted != curr:
-            if "\0" in unquoted or "/" in unquoted or "\\" in unquoted:
-                return False
-            for seg in Path(unquoted).parts:
-                if seg == "." or (len(seg) >= 2 and all(c == "." for c in seg)):
-                    return False
-            curr = unquoted
+        while True:
             unquoted = urllib.parse.unquote(curr)
-        for seg in Path(name).parts:
-            if seg == "." or (len(seg) >= 2 and all(c == "." for c in seg)):
+            if unquoted == curr:
+                break
+            if not unquoted or "\0" in unquoted or "/" in unquoted or "\\" in unquoted:
                 return False
+            curr = unquoted
+
+        if curr.startswith(".") or curr == "." or curr == ".." or all(c == "." for c in curr):
+            return False
         if name.startswith("."):
             return False
         return True
@@ -150,6 +167,9 @@ class ReplayRequestHandler(http.server.BaseHTTPRequestHandler):
                                 dirs.append({"name": item.name, "folder": item.name, "count": count})
                     except (OSError, RuntimeError):
                         continue
+            except PermissionError:
+                self.send_json(403, {"error": "Forbidden: Permission denied"})
+                return
             except (OSError, RuntimeError):
                 self.send_json(500, {"error": "Failed to read replays directory"})
                 return
@@ -173,8 +193,15 @@ class ReplayRequestHandler(http.server.BaseHTTPRequestHandler):
                 self.send_json(403, {"error": "Forbidden: Path traversal detected"})
                 return
 
-            if not target_dir.exists() or not target_dir.is_dir():
-                self.send_json(404, {"error": "Directory not found"})
+            try:
+                if not target_dir.exists() or not target_dir.is_dir():
+                    self.send_json(404, {"error": "Directory not found"})
+                    return
+            except PermissionError:
+                self.send_json(403, {"error": "Forbidden: Permission denied"})
+                return
+            except (OSError, RuntimeError):
+                self.send_json(500, {"error": "Failed to access directory"})
                 return
 
             matches = []
@@ -191,6 +218,9 @@ class ReplayRequestHandler(http.server.BaseHTTPRequestHandler):
                             matches.append(f.name)
                     except (OSError, RuntimeError):
                         continue
+            except PermissionError:
+                self.send_json(403, {"error": "Forbidden: Permission denied"})
+                return
             except (OSError, RuntimeError):
                 self.send_json(500, {"error": "Failed to read matches directory"})
                 return
@@ -224,12 +254,18 @@ class ReplayRequestHandler(http.server.BaseHTTPRequestHandler):
                 self.send_json(403, {"error": "Forbidden: Path traversal detected"})
                 return
 
-            if not target_dir.exists() or not target_dir.is_dir():
-                self.send_json(404, {"error": "Directory not found"})
+            try:
+                if not target_dir.exists() or not target_dir.is_dir():
+                    self.send_json(404, {"error": "Directory not found"})
+                    return
+                if not target_file.exists() or not target_file.is_file():
+                    self.send_json(404, {"error": "Replay file not found"})
+                    return
+            except PermissionError:
+                self.send_json(403, {"error": "Forbidden: Permission denied"})
                 return
-
-            if not target_file.exists() or not target_file.is_file():
-                self.send_json(404, {"error": "Replay file not found"})
+            except (OSError, RuntimeError):
+                self.send_json(500, {"error": "Failed to access replay file"})
                 return
 
             self.send_file(target_file, "application/json; charset=utf-8")
@@ -248,8 +284,15 @@ class ReplayRequestHandler(http.server.BaseHTTPRequestHandler):
             self.send_json(403, {"error": "Forbidden: Path traversal detected"})
             return
 
-        if not target_file.exists() or not target_file.is_file():
-            self.send_json(404, {"error": "Static asset not found"})
+        try:
+            if not target_file.exists() or not target_file.is_file():
+                self.send_json(404, {"error": "Static asset not found"})
+                return
+        except PermissionError:
+            self.send_json(403, {"error": "Forbidden: Permission denied"})
+            return
+        except (OSError, RuntimeError):
+            self.send_json(500, {"error": "Failed to access static asset"})
             return
 
         self.send_static_file(target_file)
@@ -265,8 +308,15 @@ class ReplayRequestHandler(http.server.BaseHTTPRequestHandler):
             self.send_json(403, {"error": "Forbidden: Path traversal detected"})
             return
 
-        if not target_file.exists() or not target_file.is_file():
-            self.send_json(404, {"error": "Page asset not found"})
+        try:
+            if not target_file.exists() or not target_file.is_file():
+                self.send_json(404, {"error": "Page asset not found"})
+                return
+        except PermissionError:
+            self.send_json(403, {"error": "Forbidden: Permission denied"})
+            return
+        except (OSError, RuntimeError):
+            self.send_json(500, {"error": "Failed to access page asset"})
             return
 
         self.send_static_file(target_file)
@@ -287,6 +337,8 @@ def main():
     parser.add_argument("--host", type=str, default="127.0.0.1", help="Host address to bind (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8080, help="Port to listen on (default: 8080)")
     parser.add_argument("--replays", type=str, default="", help="Path to replays directory (default: replays/)")
+    parser.add_argument("--viz", type=str, default="", help="Path to viz directory (default: dist/viz/)")
+    parser.add_argument("--web-viewer", type=str, default="", help="Path to web viewer directory (default: tools/web_viewer/)")
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parent.parent
@@ -298,11 +350,19 @@ def main():
     if not replays_dir.exists() or not replays_dir.is_dir():
         raise FileNotFoundError(f"Replay directory does not exist: {replays_dir}")
 
-    viz_dir = (repo_root / "dist" / "viz").resolve()
+    if args.viz:
+        viz_dir = Path(args.viz).resolve()
+    else:
+        viz_dir = (repo_root / "dist" / "viz").resolve()
+
     if not viz_dir.exists() or not viz_dir.is_dir():
         raise FileNotFoundError(f"Visualization directory does not exist: {viz_dir}")
 
-    web_viewer_dir = (repo_root / "tools" / "web_viewer").resolve()
+    if args.web_viewer:
+        web_viewer_dir = Path(args.web_viewer).resolve()
+    else:
+        web_viewer_dir = (repo_root / "tools" / "web_viewer").resolve()
+
     if not web_viewer_dir.exists() or not web_viewer_dir.is_dir():
         raise FileNotFoundError(f"Web viewer directory does not exist: {web_viewer_dir}")
 
@@ -310,8 +370,9 @@ def main():
     server = http.server.ThreadingHTTPServer((args.host, args.port), handler_class)
     server.daemon_threads = True
 
-    print(f"Replay server listening on http://{args.host}:{args.port}/")
-    print(f"Serving replays from: {replays_dir}")
+    actual_port = server.server_address[1]
+    print(f"Replay server listening on http://{args.host}:{actual_port}/", flush=True)
+    print(f"Serving replays from: {replays_dir}", flush=True)
 
     try:
         server.serve_forever()

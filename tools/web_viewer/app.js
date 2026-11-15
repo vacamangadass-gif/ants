@@ -91,6 +91,7 @@ function destroyCurrentViewer() {
 }
 
 async function selectMatch(fileName, pushHistory = true) {
+  folderSequence++;
   selectedMatch = fileName;
   updateActiveItem();
   updateUrl(currentFolder, selectedMatch, pushHistory);
@@ -141,24 +142,38 @@ async function loadReplay(folder, file) {
 }
 
 async function selectFolder(folderName, targetFile = null, pushHistory = true) {
-  currentFolder = folderName;
-  folderSelect.value = folderName;
   const currentFolderReq = ++folderSequence;
   loadSequence++;
 
+  folderSelect.value = folderName;
+  selectedMatch = "";
+  allMatches = [];
+  renderMatchList();
+  destroyCurrentViewer();
+  stagePlaceholder.textContent = `Loading matches for ${folderName}...`;
+  stagePlaceholder.style.display = "block";
+
+  let data;
   try {
     const response = await fetch(`/api/matches?folder=${encodeURIComponent(folderName)}`);
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}`);
     }
-    const data = await response.json();
-    if (currentFolderReq !== folderSequence) return;
-    allMatches = data;
-  } catch {
+    data = await response.json();
+  } catch (err) {
     if (currentFolderReq !== folderSequence) return;
     allMatches = [];
+    renderMatchList();
+    destroyCurrentViewer();
+    stagePlaceholder.textContent = `Failed to load matches for ${folderName}: ${err.message}`;
+    stagePlaceholder.style.display = "block";
+    return;
   }
 
+  if (currentFolderReq !== folderSequence) return;
+
+  currentFolder = folderName;
+  allMatches = data;
   renderMatchList();
 
   if (targetFile && allMatches.includes(targetFile)) {
@@ -195,16 +210,22 @@ async function init() {
     searchInput.value = "";
     if (popFolder && popFolder !== currentFolder) {
       await selectFolder(popFolder, popFile, false);
-    } else if (popFile) {
-      if (popFile !== selectedMatch) {
-        await selectMatch(popFile, false);
-      }
     } else {
-      selectedMatch = "";
-      updateActiveItem();
-      destroyCurrentViewer();
-      stagePlaceholder.textContent = "Select a match to replay";
-      stagePlaceholder.style.display = "block";
+      renderMatchList();
+      if (popFile) {
+        if (popFile !== selectedMatch) {
+          folderSequence++;
+          await selectMatch(popFile, false);
+        }
+      } else {
+        loadSequence++;
+        folderSequence++;
+        selectedMatch = "";
+        updateActiveItem();
+        destroyCurrentViewer();
+        stagePlaceholder.textContent = "Select a match to replay";
+        stagePlaceholder.style.display = "block";
+      }
     }
   });
 

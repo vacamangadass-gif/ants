@@ -90,6 +90,9 @@ jobs:
       - name: Viewer
         run: viz/build.sh
 
+      - name: Replay server tests
+        run: python3 -m unittest discover -s tools -p "test_replay_server.py" -v
+
       - name: Pack
         id: pack
         run: python3 tools/pack.py "$RUNNER_TEMP/release"
@@ -127,7 +130,7 @@ jobs:
         env:
           TB_CONFORMANCE_ONNX: ${{ runner.temp }}/starter/models/micro-bc/model.onnx
         run: |
-          python -m pip install --quiet numpy onnx pytest
+          python -m pip install --quiet numpy onnx pytest torch Pillow onnxruntime
           python -m pytest tests/ -q
 
       # What a competitor's first hour asks of a cartridge, asked of this one: admission's checks
