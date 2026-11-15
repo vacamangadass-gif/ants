@@ -4,7 +4,7 @@ const folderSelect = document.getElementById("folder-select");
 const searchInput = document.getElementById("search-input");
 const matchList = document.getElementById("match-list");
 const matchStats = document.getElementById("match-stats");
-const stageContainer = document.getElementById("replay-stage");
+const stageEl = document.getElementById("replay-stage");
 const stagePlaceholder = document.getElementById("stage-placeholder");
 
 let currentFolder = "";
@@ -12,14 +12,20 @@ let allMatches = [];
 let selectedMatch = "";
 let currentViewer = null;
 let loadSequence = 0;
+let folderSequence = 0;
 
-function updateUrl(folder, file) {
+function updateUrl(folder, file, pushHistory = true) {
   const params = new URLSearchParams();
   if (folder) params.set("folder", folder);
   if (file) params.set("file", file);
-  const newUrl = `${window.location.pathname}?${params.toString()}`;
-  if (window.location.search !== `?${params.toString()}`) {
-    window.history.pushState({ folder, file }, "", newUrl);
+  const paramStr = params.toString() ? `?${params.toString()}` : "";
+  const newUrl = `${window.location.pathname}${paramStr}`;
+  if (window.location.search !== paramStr) {
+    if (pushHistory) {
+      window.history.pushState({ folder, file }, "", newUrl);
+    } else {
+      window.history.replaceState({ folder, file }, "", newUrl);
+    }
   }
 }
 
@@ -72,10 +78,24 @@ function renderMatchList() {
   });
 }
 
-async function selectMatch(fileName) {
+function destroyCurrentViewer() {
+  if (currentViewer) {
+    try {
+      currentViewer.destroy();
+    } catch {
+      // 清理旧实例异常
+    }
+    currentViewer = null;
+  }
+  stageEl.innerHTML = "";
+}
+
+async function selectMatch(fileName, pushHistory = true) {
   selectedMatch = fileName;
   updateActiveItem();
-  updateUrl(currentFolder, selectedMatch);
+  updateUrl(currentFolder, selectedMatch, pushHistory);
+
+  destroyCurrentViewer();
   await loadReplay(currentFolder, selectedMatch);
 }
 
@@ -104,22 +124,14 @@ async function loadReplay(folder, file) {
     return;
   }
 
-  if (currentViewer) {
-    try {
-      currentViewer.destroy();
-    } catch {
-      // 忽略清理异常
-    }
-    currentViewer = null;
-  }
-
-  stageContainer.innerHTML = "";
+  destroyCurrentViewer();
   stagePlaceholder.style.display = "none";
 
   try {
     currentViewer = await mount("#replay-stage", replayData, {
       tier: "stage",
       autoplay: false,
+      theme: "dark",
     });
   } catch (err) {
     if (currentRequestId !== loadSequence) return;
@@ -128,38 +140,39 @@ async function loadReplay(folder, file) {
   }
 }
 
-async function selectFolder(folderName, targetFile = null) {
+async function selectFolder(folderName, targetFile = null, pushHistory = true) {
   currentFolder = folderName;
   folderSelect.value = folderName;
+  const currentFolderReq = ++folderSequence;
+  loadSequence++;
 
   try {
     const response = await fetch(`/api/matches?folder=${encodeURIComponent(folderName)}`);
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}`);
     }
-    allMatches = await response.json();
+    const data = await response.json();
+    if (currentFolderReq !== folderSequence) return;
+    allMatches = data;
   } catch {
+    if (currentFolderReq !== folderSequence) return;
     allMatches = [];
   }
 
   renderMatchList();
 
   if (targetFile && allMatches.includes(targetFile)) {
-    await selectMatch(targetFile);
-  } else if (!targetFile) {
+    await selectMatch(targetFile, pushHistory);
+  } else {
     selectedMatch = "";
-    if (currentViewer) {
-      try {
-        currentViewer.destroy();
-      } catch {
-        // 忽略清理异常
-      }
-      currentViewer = null;
+    destroyCurrentViewer();
+    if (targetFile) {
+      stagePlaceholder.textContent = `Match file "${targetFile}" not found in ${folderName}`;
+    } else {
+      stagePlaceholder.textContent = "Select a match to replay";
     }
-    stageContainer.innerHTML = "";
-    stagePlaceholder.textContent = "Select a match to replay";
     stagePlaceholder.style.display = "block";
-    updateUrl(currentFolder, "");
+    updateUrl(currentFolder, "", pushHistory);
   }
 }
 
@@ -167,7 +180,7 @@ async function init() {
   folderSelect.addEventListener("change", async (e) => {
     const newFolder = e.target.value;
     searchInput.value = "";
-    await selectFolder(newFolder);
+    await selectFolder(newFolder, null, true);
   });
 
   searchInput.addEventListener("input", () => {
@@ -179,10 +192,19 @@ async function init() {
     const popFolder = params.get("folder");
     const popFile = params.get("file");
 
+    searchInput.value = "";
     if (popFolder && popFolder !== currentFolder) {
-      await selectFolder(popFolder, popFile);
-    } else if (popFile && popFile !== selectedMatch) {
-      await selectMatch(popFile);
+      await selectFolder(popFolder, popFile, false);
+    } else if (popFile) {
+      if (popFile !== selectedMatch) {
+        await selectMatch(popFile, false);
+      }
+    } else {
+      selectedMatch = "";
+      updateActiveItem();
+      destroyCurrentViewer();
+      stagePlaceholder.textContent = "Select a match to replay";
+      stagePlaceholder.style.display = "block";
     }
   });
 
@@ -219,7 +241,7 @@ async function init() {
   const matchingDir = directories.find((d) => d.folder === initialFolder);
   const folderToLoad = matchingDir ? matchingDir.folder : directories[0].folder;
 
-  await selectFolder(folderToLoad, initialFile);
+  await selectFolder(folderToLoad, initialFile, false);
 }
 
 init();

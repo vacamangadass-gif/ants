@@ -2,6 +2,7 @@ import http.client
 import http.server
 import json
 from pathlib import Path
+import shutil
 import socket
 import subprocess
 import sys
@@ -9,7 +10,6 @@ import threading
 import time
 import unittest
 import urllib.error
-import urllib.parse
 import urllib.request
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -22,22 +22,6 @@ def find_free_port() -> int:
         return s.getsockname()[1]
 
 
-def remove_directory_recursive(target_dir: Path):
-    if not target_dir.exists() and not target_dir.is_symlink():
-        return
-    if target_dir.is_symlink():
-        target_dir.unlink()
-        return
-    for item in target_dir.iterdir():
-        if item.is_symlink():
-            item.unlink()
-        elif item.is_dir():
-            remove_directory_recursive(item)
-        else:
-            item.unlink()
-    target_dir.rmdir()
-
-
 class TestReplayServerAPI(unittest.TestCase):
     server: http.server.ThreadingHTTPServer = None
     server_thread: threading.Thread = None
@@ -45,17 +29,18 @@ class TestReplayServerAPI(unittest.TestCase):
     base_url: str = ""
     test_replays_dir: Path = None
     external_dir: Path = None
+    test_viz_dir: Path = None
     repo_root: Path = None
 
     @classmethod
     def setUpClass(cls):
         cls.repo_root = Path(__file__).resolve().parent.parent
         cls.test_replays_dir = cls.repo_root / "target" / "test_replays"
-        remove_directory_recursive(cls.test_replays_dir)
+        shutil.rmtree(cls.test_replays_dir, ignore_errors=True)
         cls.test_replays_dir.mkdir(parents=True, exist_ok=True)
 
         cls.external_dir = cls.repo_root / "target" / "test_external_dir"
-        remove_directory_recursive(cls.external_dir)
+        shutil.rmtree(cls.external_dir, ignore_errors=True)
         cls.external_dir.mkdir(parents=True, exist_ok=True)
         (cls.external_dir / "external_match.json").write_text(json.dumps({"external": True}))
 
@@ -63,12 +48,17 @@ class TestReplayServerAPI(unittest.TestCase):
         folder_a.mkdir(parents=True, exist_ok=True)
         (folder_a / "match1.json").write_text(json.dumps({"game": "ants", "id": 1}))
         (folder_a / "match2.json").write_text(json.dumps({"game": "ants", "id": 2}))
+        (folder_a / "match.1..2.json").write_text(json.dumps({"game": "ants", "id": 3}))
+        (folder_a / "win_50%.json").write_text(json.dumps({"game": "ants", "id": 4}))
         (folder_a / "notes.txt").write_text("not a replay")
         (folder_a / "outside_file_link.json").symlink_to(cls.external_dir / "external_match.json")
 
         folder_b = cls.test_replays_dir / "folder_b"
         folder_b.mkdir(parents=True, exist_ok=True)
         (folder_b / "final.json").write_text(json.dumps({"game": "ants", "winner": 0}))
+
+        # 内部跨文件夹符号链接：folder_a 下链接到 folder_b/final.json，应在 folder_a 中被过滤
+        (folder_a / "cross_folder_link.json").symlink_to(folder_b / "final.json")
 
         empty_folder = cls.test_replays_dir / "empty_folder"
         empty_folder.mkdir(parents=True, exist_ok=True)
@@ -79,7 +69,21 @@ class TestReplayServerAPI(unittest.TestCase):
 
         (cls.test_replays_dir / "outside_folder_link").symlink_to(cls.external_dir, target_is_directory=True)
 
-        viz_dir = cls.repo_root / "dist" / "viz"
+        # 准备 viz 测试目录：若仓库中已有 dist/viz 则直接复用，否则自动构建独立测试桩
+        real_viz_dir = cls.repo_root / "dist" / "viz"
+        if real_viz_dir.exists() and (real_viz_dir / "viz.js").exists():
+            viz_dir = real_viz_dir
+        else:
+            cls.test_viz_dir = cls.repo_root / "target" / "test_viz"
+            shutil.rmtree(cls.test_viz_dir, ignore_errors=True)
+            cls.test_viz_dir.mkdir(parents=True, exist_ok=True)
+            (cls.test_viz_dir / "viz.js").write_text("// test viz.js")
+            (cls.test_viz_dir / "engine.json").write_text("{}")
+            engine_dir = cls.test_viz_dir / "engine"
+            engine_dir.mkdir(parents=True, exist_ok=True)
+            (engine_dir / "tb-ants.core.wasm").write_bytes(b"\x00asm\x01\x00\x00\x00")
+            viz_dir = cls.test_viz_dir
+
         web_viewer_dir = cls.repo_root / "tools" / "web_viewer"
 
         handler_class = create_handler_class(cls.test_replays_dir, viz_dir, web_viewer_dir)
@@ -98,13 +102,15 @@ class TestReplayServerAPI(unittest.TestCase):
             cls.server.server_close()
         if cls.server_thread:
             cls.server_thread.join()
-        remove_directory_recursive(cls.test_replays_dir)
+        shutil.rmtree(cls.test_replays_dir, ignore_errors=True)
         if hasattr(cls, "external_dir") and cls.external_dir is not None:
-            remove_directory_recursive(cls.external_dir)
+            shutil.rmtree(cls.external_dir, ignore_errors=True)
+        if hasattr(cls, "test_viz_dir") and cls.test_viz_dir is not None:
+            shutil.rmtree(cls.test_viz_dir, ignore_errors=True)
 
-    def fetch(self, path: str):
+    def fetch(self, path: str, method: str = "GET"):
         url = f"{self.base_url}{path}"
-        req = urllib.request.Request(url)
+        req = urllib.request.Request(url, method=method)
         try:
             with urllib.request.urlopen(req) as resp:
                 return resp.status, resp.headers, resp.read()
@@ -127,7 +133,8 @@ class TestReplayServerAPI(unittest.TestCase):
 
         self.assertEqual(data[0]["folder"], "folder_a")
         self.assertEqual(data[0]["name"], "folder_a")
-        self.assertEqual(data[0]["count"], 2)
+        # match1.json, match2.json, match.1..2.json, win_50%.json (不计 notes.txt、外部软链接与跨目录软链接)
+        self.assertEqual(data[0]["count"], 4)
 
         self.assertEqual(data[1]["folder"], "folder_b")
         self.assertEqual(data[1]["name"], "folder_b")
@@ -139,8 +146,9 @@ class TestReplayServerAPI(unittest.TestCase):
         self.assertIn("application/json", headers.get("Content-Type", ""))
 
         matches = json.loads(body.decode("utf-8"))
-        self.assertEqual(matches, ["match1.json", "match2.json"])
+        self.assertEqual(matches, ["match.1..2.json", "match1.json", "match2.json", "win_50%.json"])
         self.assertNotIn("outside_file_link.json", matches)
+        self.assertNotIn("cross_folder_link.json", matches)
         self.assertNotIn("notes.txt", matches)
 
     def test_matches_error_cases(self):
@@ -153,6 +161,10 @@ class TestReplayServerAPI(unittest.TestCase):
         status_notfound, _, _ = self.fetch("/api/matches?folder=nonexistent_folder")
         self.assertEqual(status_notfound, 404)
 
+        # 嵌套斜杠必须被拦截为 403
+        status_nested, _, _ = self.fetch("/api/matches?folder=folder_a/sub")
+        self.assertEqual(status_nested, 403)
+
     def test_replay_payload_retrieval(self):
         status, headers, body = self.fetch("/api/replay?folder=folder_a&file=match1.json")
         self.assertEqual(status, 200)
@@ -160,6 +172,15 @@ class TestReplayServerAPI(unittest.TestCase):
 
         payload = json.loads(body.decode("utf-8"))
         self.assertEqual(payload, {"game": "ants", "id": 1})
+
+        # 验证包含双点号与百分号的合法文件名能正常读取
+        status_dot, _, body_dot = self.fetch("/api/replay?folder=folder_a&file=match.1..2.json")
+        self.assertEqual(status_dot, 200)
+        self.assertEqual(json.loads(body_dot.decode("utf-8")), {"game": "ants", "id": 3})
+
+        status_pct, _, body_pct = self.fetch("/api/replay?folder=folder_a&file=win_50%.json")
+        self.assertEqual(status_pct, 200)
+        self.assertEqual(json.loads(body_pct.decode("utf-8")), {"game": "ants", "id": 4})
 
     def test_replay_error_cases(self):
         status_missing_file, _, _ = self.fetch("/api/replay?folder=folder_a")
@@ -179,6 +200,10 @@ class TestReplayServerAPI(unittest.TestCase):
 
         status_notfound_folder, _, _ = self.fetch("/api/replay?folder=missing&file=match1.json")
         self.assertEqual(status_notfound_folder, 404)
+
+        # 跨文件夹软链接必须返回 403
+        status_cross, _, _ = self.fetch("/api/replay?folder=folder_a&file=cross_folder_link.json")
+        self.assertEqual(status_cross, 403)
 
     def test_path_traversal_defense(self):
         traversal_query_cases = [
@@ -212,26 +237,39 @@ class TestReplayServerAPI(unittest.TestCase):
             self.assertEqual(status, 403, f"Path traversal should return 403: {path}")
 
         conn = http.client.HTTPConnection("127.0.0.1", self.server_port)
-        raw_traversal_paths = [
-            "/cartridges/ants/../../tools/replay_server.py",
-            "/cartridges/ants/%2e%2e/%2e%2e/tools/replay_server.py",
-            "/cartridges/ants/....//etc/passwd",
-            "/cartridges/ants/%252e%252e%252fetc/passwd",
-            "/cartridges/ants/..\\etc/passwd",
-            "/cartridges/ants/..\\..\\etc/passwd",
-            "/../../etc/passwd",
-            "/%2e%2e/%2e%2e/etc/passwd",
-            "/....//etc/passwd",
-            "/%252e%252e%252fetc/passwd",
-            "/..\\etc/passwd",
-            "/..\\..\\etc/passwd",
-        ]
-        for raw_path in raw_traversal_paths:
-            conn.request("GET", raw_path)
-            resp = conn.getresponse()
-            resp.read()
-            self.assertEqual(resp.status, 403, f"Raw path traversal should return 403: {raw_path}")
-        conn.close()
+        try:
+            raw_traversal_paths = [
+                "/cartridges/ants/../../tools/replay_server.py",
+                "/cartridges/ants/%2e%2e/%2e%2e/tools/replay_server.py",
+                "/cartridges/ants/....//etc/passwd",
+                "/cartridges/ants/%252e%252e%252fetc/passwd",
+                "/cartridges/ants/..\\etc/passwd",
+                "/cartridges/ants/..\\..\\etc/passwd",
+                "/../../etc/passwd",
+                "/%2e%2e/%2e%2e/etc/passwd",
+                "/....//etc/passwd",
+                "/%252e%252e%252fetc/passwd",
+                "/..\\etc/passwd",
+                "/..\\..\\etc/passwd",
+            ]
+            for raw_path in raw_traversal_paths:
+                conn.request("GET", raw_path)
+                resp = conn.getresponse()
+                resp.read()
+                self.assertEqual(resp.status, 403, f"Raw path traversal should return 403: {raw_path}")
+        finally:
+            conn.close()
+
+    def test_head_request_support(self):
+        status, headers, body = self.fetch("/api/directories", method="HEAD")
+        self.assertEqual(status, 200)
+        self.assertIn("application/json", headers.get("Content-Type", ""))
+        self.assertEqual(len(body), 0)
+
+        status_root, headers_root, body_root = self.fetch("/", method="HEAD")
+        self.assertEqual(status_root, 200)
+        self.assertIn("text/html", headers_root.get("Content-Type", ""))
+        self.assertEqual(len(body_root), 0)
 
     def test_cartridge_static_routing(self):
         status_js, headers_js, body_js = self.fetch("/cartridges/ants/viz.js")
@@ -280,8 +318,9 @@ class TestServerProcessLifecycle(unittest.TestCase):
     def test_cli_startup_and_graceful_shutdown(self):
         repo_root = Path(__file__).resolve().parent.parent
         test_dir = repo_root / "target" / "test_lifecycle_replays"
-        remove_directory_recursive(test_dir)
+        shutil.rmtree(test_dir, ignore_errors=True)
         test_dir.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(lambda: shutil.rmtree(test_dir, ignore_errors=True))
 
         sample_folder = test_dir / "sample"
         sample_folder.mkdir(parents=True, exist_ok=True)
@@ -299,10 +338,27 @@ class TestServerProcessLifecycle(unittest.TestCase):
 
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
+        def cleanup_process():
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+            if proc.stdout:
+                proc.stdout.close()
+            if proc.stderr:
+                proc.stderr.close()
+
+        self.addCleanup(cleanup_process)
+
         url = f"http://127.0.0.1:{free_port}/api/directories"
         connected = False
         start_time = time.time()
         while time.time() - start_time < 5.0:
+            if proc.poll() is not None:
+                break
             try:
                 with urllib.request.urlopen(url, timeout=0.5) as resp:
                     if resp.status == 200:
@@ -316,12 +372,6 @@ class TestServerProcessLifecycle(unittest.TestCase):
         proc.terminate()
         proc.wait(timeout=3.0)
         self.assertIsNotNone(proc.returncode)
-        if proc.stdout:
-            proc.stdout.close()
-        if proc.stderr:
-            proc.stderr.close()
-
-        remove_directory_recursive(test_dir)
 
 
 if __name__ == "__main__":
