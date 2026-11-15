@@ -378,9 +378,12 @@ class TestReplayServerAPI(unittest.TestCase):
         self.assertIn("application/wasm", headers_wasm.get("Content-Type", ""))
         self.assertTrue(len(body_wasm) > 0)
 
-        status_json, headers_json, _ = self.fetch("/cartridges/ants/engine.json")
+        status_json, headers_json, body_json = self.fetch("/cartridges/ants/engine.json")
         self.assertEqual(status_json, 200)
         self.assertIn("application/json", headers_json.get("Content-Type", ""))
+        engine_meta = json.loads(body_json.decode("utf-8"))
+        self.assertIsInstance(engine_meta.get("engine_digest"), str)
+        self.assertTrue(engine_meta["engine_digest"].startswith("sha256:"))
 
         status_missing, _, _ = self.fetch("/cartridges/ants/missing_file.js")
         self.assertEqual(status_missing, 404)

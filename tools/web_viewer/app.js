@@ -14,6 +14,56 @@ let currentViewer = null;
 let loadSequence = 0;
 let folderSequence = 0;
 let folderLoadError = "";
+let viewerEngineDigest = "";
+
+function showStageMessage(title, { isError = false, details = [] } = {}) {
+  stagePlaceholder.innerHTML = "";
+  stagePlaceholder.classList.toggle("is-error", isError);
+
+  const titleEl = document.createElement("div");
+  titleEl.className = "stage-placeholder-title";
+  titleEl.textContent = title;
+  stagePlaceholder.appendChild(titleEl);
+
+  if (details.length > 0) {
+    const detailsEl = document.createElement("div");
+    detailsEl.className = "stage-placeholder-details";
+    details.forEach((detail) => {
+      const lineEl = document.createElement("div");
+      lineEl.className = "stage-placeholder-detail";
+      lineEl.textContent = detail;
+      detailsEl.appendChild(lineEl);
+    });
+    stagePlaceholder.appendChild(detailsEl);
+  }
+
+  stagePlaceholder.style.display = "block";
+}
+
+function hideStagePlaceholder() {
+  stagePlaceholder.classList.remove("is-error");
+  stagePlaceholder.innerHTML = "";
+  stagePlaceholder.style.display = "none";
+}
+
+async function fetchViewerEngineDigest() {
+  const response = await fetch("/cartridges/ants/engine.json");
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status} fetching /cartridges/ants/engine.json`);
+  }
+  const metadata = await response.json();
+  const digest =
+    metadata &&
+    typeof metadata === "object" &&
+    !Array.isArray(metadata) &&
+    typeof metadata.engine_digest === "string"
+      ? metadata.engine_digest.trim()
+      : "";
+  if (!digest) {
+    throw new Error('Missing "engine_digest" field in /cartridges/ants/engine.json');
+  }
+  return digest;
+}
 
 function updateUrl(folder, file, pushHistory = true) {
   const params = new URLSearchParams();
@@ -113,8 +163,15 @@ async function selectMatch(fileName, pushHistory = true) {
 async function loadReplay(folder, file) {
   const currentRequestId = ++loadSequence;
 
-  stagePlaceholder.textContent = `Loading ${file}...`;
-  stagePlaceholder.style.display = "block";
+  if (!viewerEngineDigest) {
+    destroyCurrentViewer();
+    showStageMessage("Failed to initialize replay viewer: missing viewer engine_digest.", {
+      isError: true,
+    });
+    return;
+  }
+
+  showStageMessage(`Loading ${file}...`);
 
   let replayData;
   try {
@@ -126,8 +183,8 @@ async function loadReplay(folder, file) {
     replayData = await response.json();
   } catch (err) {
     if (currentRequestId !== loadSequence) return;
-    stagePlaceholder.textContent = `Failed to load match: ${err.message}`;
-    stagePlaceholder.style.display = "block";
+    destroyCurrentViewer();
+    showStageMessage(`Failed to load match: ${err.message}`, { isError: true });
     return;
   }
 
@@ -135,8 +192,44 @@ async function loadReplay(folder, file) {
     return;
   }
 
+  const rawReplayDigest =
+    replayData && typeof replayData === "object" && !Array.isArray(replayData)
+      ? replayData.engine_digest
+      : undefined;
+  const trimmedReplayDigest =
+    typeof rawReplayDigest === "string" ? rawReplayDigest.trim() : "";
+
+  if (!trimmedReplayDigest || rawReplayDigest !== viewerEngineDigest) {
+    destroyCurrentViewer();
+    const isMissingOrInvalid = !trimmedReplayDigest;
+    let replayDigestDisplay;
+    if (rawReplayDigest === undefined || rawReplayDigest === null) {
+      replayDigestDisplay = "(missing)";
+    } else if (typeof rawReplayDigest !== "string") {
+      replayDigestDisplay = `(invalid: ${JSON.stringify(rawReplayDigest)})`;
+    } else if (trimmedReplayDigest === "") {
+      replayDigestDisplay = "(empty)";
+    } else {
+      replayDigestDisplay = rawReplayDigest;
+    }
+
+    showStageMessage(
+      isMissingOrInvalid
+        ? `Cannot load "${file}": replay is missing engine_digest.`
+        : `Cannot load "${file}": engine_digest mismatch.`,
+      {
+        isError: true,
+        details: [
+          `Replay engine_digest: ${replayDigestDisplay}`,
+          `Viewer engine_digest: ${viewerEngineDigest}`,
+        ],
+      }
+    );
+    return;
+  }
+
   destroyCurrentViewer();
-  stagePlaceholder.style.display = "none";
+  hideStagePlaceholder();
 
   try {
     const viewer = await mount("#replay-stage", replayData, {
@@ -155,8 +248,8 @@ async function loadReplay(folder, file) {
     currentViewer = viewer;
   } catch (err) {
     if (currentRequestId !== loadSequence) return;
-    stagePlaceholder.textContent = `Error mounting viewer: ${err.message}`;
-    stagePlaceholder.style.display = "block";
+    destroyCurrentViewer();
+    showStageMessage(`Error mounting viewer: ${err.message}`, { isError: true });
   }
 }
 
@@ -171,8 +264,7 @@ async function selectFolder(folderName, targetFile = null, pushHistory = true) {
   allMatches = [];
   renderMatchList();
   destroyCurrentViewer();
-  stagePlaceholder.textContent = `Loading matches for ${folderName}...`;
-  stagePlaceholder.style.display = "block";
+  showStageMessage(`Loading matches for ${folderName}...`);
 
   let data;
   try {
@@ -187,8 +279,9 @@ async function selectFolder(folderName, targetFile = null, pushHistory = true) {
     folderLoadError = err.message || "Request failed";
     renderMatchList();
     destroyCurrentViewer();
-    stagePlaceholder.textContent = `Failed to load matches for ${folderName}: ${err.message}`;
-    stagePlaceholder.style.display = "block";
+    showStageMessage(`Failed to load matches for ${folderName}: ${err.message}`, {
+      isError: true,
+    });
     return;
   }
 
@@ -205,16 +298,42 @@ async function selectFolder(folderName, targetFile = null, pushHistory = true) {
     selectedMatch = "";
     destroyCurrentViewer();
     if (targetFile) {
-      stagePlaceholder.textContent = `Match file "${targetFile}" not found in ${folderName}`;
+      showStageMessage(`Match file "${targetFile}" not found in ${folderName}`, {
+        isError: true,
+      });
     } else {
-      stagePlaceholder.textContent = "Select a match to replay";
+      showStageMessage("Select a match to replay");
     }
-    stagePlaceholder.style.display = "block";
     updateUrl(currentFolder, "", pushHistory);
   }
 }
 
 async function init() {
+  showStageMessage("Loading viewer engine metadata...");
+  try {
+    viewerEngineDigest = await fetchViewerEngineDigest();
+  } catch (err) {
+    viewerEngineDigest = "";
+    const reason = (err && err.message) ? err.message : "Request failed";
+    destroyCurrentViewer();
+    folderSelect.innerHTML = "";
+    const opt = document.createElement("option");
+    opt.value = "";
+    opt.textContent = "Viewer initialization failed";
+    folderSelect.appendChild(opt);
+    folderSelect.disabled = true;
+    searchInput.disabled = true;
+    matchStats.textContent = "Viewer unavailable";
+    matchList.innerHTML = "";
+    const errorLi = document.createElement("li");
+    errorLi.textContent = "Engine metadata unavailable";
+    errorLi.style.cursor = "default";
+    errorLi.style.color = "#f87171";
+    matchList.appendChild(errorLi);
+    showStageMessage(`Failed to initialize replay viewer: ${reason}`, { isError: true });
+    return;
+  }
+
   folderSelect.addEventListener("change", async (e) => {
     const newFolder = e.target.value;
     searchInput.value = "";
@@ -247,8 +366,9 @@ async function init() {
           selectedMatch = "";
           updateActiveItem();
           destroyCurrentViewer();
-          stagePlaceholder.textContent = `Match file "${popFile}" not found in ${currentFolder}`;
-          stagePlaceholder.style.display = "block";
+          showStageMessage(`Match file "${popFile}" not found in ${currentFolder}`, {
+            isError: true,
+          });
         } else if (popFile !== selectedMatch) {
           await selectMatch(popFile, false);
         }
@@ -258,8 +378,7 @@ async function init() {
         selectedMatch = "";
         updateActiveItem();
         destroyCurrentViewer();
-        stagePlaceholder.textContent = "Select a match to replay";
-        stagePlaceholder.style.display = "block";
+        showStageMessage("Select a match to replay");
       }
     }
   });
@@ -285,8 +404,7 @@ async function init() {
     opt.textContent = "Failed to load folders";
     folderSelect.appendChild(opt);
     renderMatchList();
-    stagePlaceholder.textContent = `Failed to load replay folders: ${dirError}`;
-    stagePlaceholder.style.display = "block";
+    showStageMessage(`Failed to load replay folders: ${dirError}`, { isError: true });
     return;
   }
   if (directories.length === 0) {
@@ -295,8 +413,7 @@ async function init() {
     opt.textContent = "No replay folders found";
     folderSelect.appendChild(opt);
     renderMatchList();
-    stagePlaceholder.textContent = "No replay folders found";
-    stagePlaceholder.style.display = "block";
+    showStageMessage("No replay folders found");
     return;
   }
 
