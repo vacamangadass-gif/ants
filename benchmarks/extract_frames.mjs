@@ -63,9 +63,12 @@ export function analyzeReplay(content) {
       nextPos.set(a[3], [a[0], a[1]]);
     }
 
+    const cols = fNow.size ? fNow.size[1] : (replay.map ? replay.map.cols : 0);
     for (let s = 0; s < numSeats; s++) {
       const orders = delta.a[s] || '';
-      const myAnts = fNow.ants.filter(a => a[2] === s);
+      const myAnts = fNow.ants
+        .filter(a => a[2] === s)
+        .sort((a, b) => (a[0] * cols + a[1]) - (b[0] * cols + b[1]) || (a[3] - b[3]));
       for (let i = 0; i < myAnts.length; i++) {
         const ord = orders[i] || '-';
         if (ord === 'N' || ord === 'E' || ord === 'S' || ord === 'W') {
