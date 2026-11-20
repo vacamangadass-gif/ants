@@ -384,11 +384,7 @@ def collect_stratified_d0(
         "hold_rate": round(hold_ants / max(total_ants, 1), 4),
         "own_hill_hold_rate": round(own_hill_holds / max(own_hill_ants, 1), 4),
         "bucket_rows": bucket_counts,
-        "multi_hill_bucket_share": round(
-            (bucket_counts.get("2p-multi", 0) + bucket_counts.get("4p-multi", 0) + int(bucket_counts.get("6p-all", 0) * 0.55) + int(bucket_counts.get("basic-3p-8p", 0) * 0.5))
-            / max(written, 1),
-            4,
-        ),
+        "multi_hill_bucket_share": round(multi_hill_rows / max(written, 1), 4),
         "multiseat_4p6p_share": round(multiseat_4p6p_rows / max(written, 1), 4),
         "episodes": episodes,
         "reasons": reasons,
@@ -632,7 +628,7 @@ def train_iteration_model(
         "--out",
         str(out_dir),
     ]
-    if init_weights is not None and init_weights.exists():
+    if init_weights is not None:
         cmd_args.extend(["--init-weights", str(init_weights.resolve())])
 
     bc.main(cmd_args)

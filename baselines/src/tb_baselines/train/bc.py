@@ -256,7 +256,9 @@ def main(argv: list[str] | None = None) -> None:
 
     spec = override(classes()[a.cls], a)
     model = nets.build(spec, memory=a.memory).to(dev)
-    if a.init_weights is not None and a.init_weights.exists():
+    if a.init_weights is not None:
+        if not a.init_weights.exists():
+            raise FileNotFoundError(f"指定的初始检查点权重文件不存在: {a.init_weights}")
         ckpt = torch.load(a.init_weights, map_location=dev, weights_only=True)
         model.load_state_dict(ckpt["trunk"])
     b = budget(a.cls)
