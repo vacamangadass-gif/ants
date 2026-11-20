@@ -1091,14 +1091,14 @@ def compute_enemy_threat_penalty(
         friendly_coverage += np.roll(np.roll(friendly_grid, dr, axis=0), dc, axis=1)
 
     has_foe = (foe_coverage > 0) & passable_mask
-    severe_threat = has_foe & (foe_coverage > friendly_coverage)
-    moderate_threat = has_foe & (foe_coverage == friendly_coverage)
+    # 仅在严格以少打多（敌方火力覆盖 > 己方火力覆盖）时施加威胁斥力；
+    # 1v1 等势或己方占优交战绝不施加斥力，防止策略畏战退缩。
+    outnumbered = has_foe & (foe_coverage > friendly_coverage)
 
-    raw_threat[severe_threat] = float(max_delay)
-    raw_threat[moderate_threat] = float(max(1, max_delay // 2))
+    raw_threat[outnumbered] = float(max_delay)
 
     if width_map is not None:
-        chokepoint_threat = has_foe & (width_map <= 1)
+        chokepoint_threat = outnumbered & (width_map <= 1)
         raw_threat[chokepoint_threat] = float(max_delay)
 
     raw_threat[~passable_mask] = 0.0

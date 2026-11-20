@@ -147,22 +147,12 @@ class MCMFTeacher:
         }
         enemy_hills = get_known_enemy_hills(obs, water, seen, memory)
 
-        turn = obs.get("turn", 1)
         visible_foes = obs.get("foes", [])
 
-        # 席位判定：检测是否存在多席位混战（席位数量 > 2）
-        is_multi_seat = (
-            any(len(h) >= 3 and h[2] > 1 for h in obs.get("hills", []))
-            or any(len(f) >= 3 and f[2] > 1 for f in visible_foes)
-            or len(friendly_hills_set) > 1
-            or max(rows, cols) >= 36
-            or (memory is not None and any(len(h) >= 3 and h[2] > 1 for h in memory.get("hills_seen", [])))
-            or (obs.get("players") is not None and (int(obs["players"]) if isinstance(obs["players"], (int, str)) else len(obs["players"])) > 2)
-        )
-
-        # 基地蚁穴就近防守态势判定
+        # 基地蚁穴就近防守态势判定（仅收集威胁己方蚁穴的近身敌蚁，绝不回退至己方蚁穴格原地驻留）
         threatened_hills: set[tuple[int, int]] = set()
         hill_threat_counts: dict[tuple[int, int], int] = {}
+        threat_foe_coords: list[tuple[int, int]] = []
         if friendly_hills_set and visible_foes:
             for hr, hc in friendly_hills_set:
                 near_foes = 0
@@ -174,6 +164,7 @@ class MCMFTeacher:
                     dc = min(diff_c, cols - diff_c)
                     if dr + dc <= 12 or (dr * dr + dc * dc) <= 100:
                         near_foes += 1
+                        threat_foe_coords.append((fr, fc))
                 if near_foes > 0:
                     threatened_hills.add((hr, hc))
                     hill_threat_counts[(hr, hc)] = near_foes
@@ -201,7 +192,7 @@ class MCMFTeacher:
                     if d_h <= 16 or assigned_count < 2:
                         defense_set.add(idx_ant)
                         assigned_count += 1
-                        if assigned_count >= needed_defenders or len(defense_set) >= total_ants // 2:
+                        if assigned_count >= needed_defenders or len(defense_set) >= max(1, total_ants // 2):
                             break
 
         # 敌方威胁与通道延时开销计算
@@ -317,22 +308,15 @@ class MCMFTeacher:
                 source_grid=source_grid_hill,
             )
 
-        # 自适应态势感知突击调度比例计算
+        # 自适应态势感知突击调度比例计算（仅依赖可观测蚁群规模，消除失效的 turn 键与多席位突击饥饿）
         if self.adaptive_raid:
-            if is_multi_seat:
-                if turn <= 100 or total_ants < 25:
-                    current_raid_ratio = 0.0 if total_ants < 15 else 0.08
-                else:
-                    has_overwhelming_advantage = (
-                        total_ants >= 60
-                        or (len(visible_foes) > 0 and total_ants >= len(visible_foes) * 2)
-                    )
-                    if has_overwhelming_advantage:
-                        current_raid_ratio = min(0.30, 0.10 + 0.20 * min(1.0, (total_ants - 25) / 50.0))
-                    else:
-                        current_raid_ratio = 0.10
+            if total_ants < self.min_raid_ants:
+                current_raid_ratio = 0.0
             else:
-                current_raid_ratio = self.raid_ratio
+                # 随兵力从 min_raid_ants 平滑提升至 raid_ratio，确保任意尺寸与多丘棋盘均保持稳定进攻压力
+                ramp = min(1.0, (total_ants - self.min_raid_ants) / 20.0)
+                base_floor = min(self.raid_ratio, 0.25)
+                current_raid_ratio = base_floor + (self.raid_ratio - base_floor) * ramp
         else:
             current_raid_ratio = self.raid_ratio
 
@@ -389,11 +373,8 @@ class MCMFTeacher:
             if self.max_depth is not None:
                 effective_depth = self.max_depth
             else:
-                max_dim = max(rows, cols)
-                if max_dim >= 80:
-                    effective_depth = max(32, max_dim // 2)
-                else:
-                    effective_depth = 16
+                # 严禁静默截断为 16 步；默认至少 32 步并按环面半周长自适应扩展
+                effective_depth = max(32, max(rows, cols) // 2)
 
             non_raid_ant_positions = [ant_positions[idx_ant] for idx_ant in non_raid_ants]
 
@@ -555,23 +536,27 @@ class MCMFTeacher:
                     self._last_winning_targets = []
                     self._last_winning_fields = []
 
-        # 4. 基地防守势能场与未获配兵力向探索前沿平滑分流
+        # 4. 基地外围拦截势能场（严禁以己方蚁穴格自身为终点，杜绝产卵位堵塞）与探索/突击分流
         dist_fortify: np.ndarray | None = None
         meta_fortify: FieldMetadata | None = None
-        if friendly_hills_set:
-            friendly_mask = np.zeros((rows, cols), dtype=bool)
+        if threatened_hills and threat_foe_coords:
+            intercept_mask = np.zeros((rows, cols), dtype=bool)
             source_grid_fortify = np.zeros((rows, cols), dtype=np.int32)
-            source_hills = threatened_hills if threatened_hills else friendly_hills_set
-            for r, c in source_hills:
-                if passable[r, c]:
-                    friendly_mask[r, c] = True
-            if friendly_mask.any():
+            for fr, fc in threat_foe_coords:
+                if passable[fr, fc] and (fr, fc) not in friendly_hills_set:
+                    intercept_mask[fr, fc] = True
+                else:
+                    for dr, dc in DELTAS:
+                        nr, nc = (fr + dr) % rows, (fc + dc) % cols
+                        if passable[nr, nc] and (nr, nc) not in friendly_hills_set:
+                            intercept_mask[nr, nc] = True
+            if intercept_mask.any():
                 dist_fortify, meta_fortify = compute_geodesic_potential_field(
-                    sources={0: friendly_mask},
+                    sources={0: intercept_mask},
                     passable_mask=passable,
                     rows=rows,
                     cols=cols,
-                    max_depth=None,
+                    max_depth=16,
                     return_meta=True,
                     source_grid=source_grid_fortify,
                 )
@@ -613,29 +598,20 @@ class MCMFTeacher:
 
             frontier_has_target = bool((dist_frontier < FAR).any())
             hill_has_target = bool((dist_hill < FAR).any())
-            fortify_has_target = bool(friendly_hills_set and dist_fortify is not None and (dist_fortify < FAR).any())
 
             for idx_ant in remaining_ants:
                 ar, ac = ant_positions[idx_ant]
                 if dist_frontier[ar, ac] < FAR:
                     ant_tasks[idx_ant] = TaskState.EXPLORE
                     ant_dist_map[idx_ant] = (dist_frontier, meta_frontier)
-                elif friendly_hills_set and dist_fortify is not None and dist_fortify[ar, ac] < FAR:
-                    ant_tasks[idx_ant] = TaskState.FORTIFY
-                    ant_dist_map[idx_ant] = (dist_fortify, meta_fortify)
-                elif fortify_has_target:
-                    ant_tasks[idx_ant] = TaskState.FORTIFY
-                    ant_dist_map[idx_ant] = (dist_fortify, meta_fortify)
+                elif hill_has_target and dist_hill[ar, ac] < FAR:
+                    # 消除无前沿时回退 FORTIFY 驻守己方蚁穴的缺陷，改由已知敌丘牵引推进
+                    ant_tasks[idx_ant] = TaskState.ASSAULT
+                    ant_dist_map[idx_ant] = (dist_hill, meta_hill)
                 elif frontier_has_target:
                     ant_tasks[idx_ant] = TaskState.EXPLORE
                     ant_dist_map[idx_ant] = (dist_frontier, meta_frontier)
-                elif friendly_hills_set and dist_fortify is not None:
-                    ant_tasks[idx_ant] = TaskState.FORTIFY
-                    ant_dist_map[idx_ant] = (dist_fortify, meta_fortify)
-                elif not friendly_hills_set and is_phase_b and dist_hill[ar, ac] < FAR:
-                    ant_tasks[idx_ant] = TaskState.ASSAULT
-                    ant_dist_map[idx_ant] = (dist_hill, meta_hill)
-                elif not friendly_hills_set and is_phase_b and hill_has_target:
+                elif hill_has_target:
                     ant_tasks[idx_ant] = TaskState.ASSAULT
                     ant_dist_map[idx_ant] = (dist_hill, meta_hill)
                 else:
@@ -646,7 +622,7 @@ class MCMFTeacher:
             ant_tasks[idx_ant] = TaskState.FORTIFY
             if dist_fortify is not None and dist_fortify[ant_positions[idx_ant][0], ant_positions[idx_ant][1]] < FAR:
                 ant_dist_map[idx_ant] = (dist_fortify, meta_fortify)
-            elif dist_frontier is not None:
+            elif dist_frontier is not None and dist_frontier[ant_positions[idx_ant][0], ant_positions[idx_ant][1]] < FAR:
                 ant_dist_map[idx_ant] = (dist_frontier, meta_frontier)
             else:
                 ant_dist_map[idx_ant] = (dist_hill, meta_hill)
@@ -656,24 +632,30 @@ class MCMFTeacher:
 
         self._last_ant_tasks = dict(ant_tasks)
 
-        # 5. 生成候选移动动作序列与测地负梯度下降
+        # 5. 生成候选移动动作序列与测地负梯度下降（己方蚁穴上的蚂蚁强制优先走离，杜绝阻塞产卵）
         potentials = np.zeros(total_ants, dtype=np.int32)
         candidate_sequences: list[list[int]] = []
         candidate_rejections_map: dict[int, dict[int, str]] = {i: {} for i in range(total_ants)}
 
+        effective_tiers = list(squad_tiers) if squad_tiers is not None else [1] * total_ants
+        has_own_hill_ant = False
         for i in range(total_ants):
             ar, ac = ant_positions[i]
+            on_own_hill = (ar, ac) in friendly_hills_set
+            if on_own_hill:
+                effective_tiers[i] = 0
+                has_own_hill_ant = True
             dist_field, _ = ant_dist_map[i]
             cur_d = int(dist_field[ar, ac])
             potentials[i] = cur_d
             rejections = candidate_rejections_map[i]
 
-            if i in ant_bound_target and (ar, ac) == ant_bound_target[i]:
+            if (not on_own_hill) and i in ant_bound_target and (ar, ac) == ant_bound_target[i]:
                 candidate_sequences.append([HOLD])
                 continue
 
-            valid_moves: list[tuple[int, int]] = []
-            passable_moves: list[int] = []
+            valid_moves: list[tuple[int, int, int]] = []
+            fallback_off_hill: list[tuple[int, int, int]] = []
             for k in range(4):
                 dr, dc = DELTAS[k]
                 nr, nc = (ar + dr) % rows, (ac + dc) % cols
@@ -684,40 +666,43 @@ class MCMFTeacher:
                     rejections[k] = RejectionCode.FOOD.value
                     continue
                 step_d = int(dist_field[nr, nc])
+                threat_cost = int(int_delay[nr, nc]) if int_delay is not None else 0
+                step_onto_hill = 1 if ((not on_own_hill) and (nr, nc) in friendly_hills_set) else 0
                 if step_d >= cur_d:
+                    if on_own_hill:
+                        fallback_off_hill.append((threat_cost, step_d, k))
                     if (nr, nc) in ant_positions_set:
                         rejections[k] = RejectionCode.TAKEN.value
                     else:
                         rejections[k] = RejectionCode.GRADIENT_NON_DECREASING.value
                     continue
-                threat_cost = int(int_delay[nr, nc]) if int_delay is not None else 0
-                valid_moves.append((step_d + threat_cost * 2, k))
+                valid_moves.append((step_onto_hill, step_d + threat_cost * 2, k))
 
-            valid_moves.sort(key=lambda item: (item[0], item[1]))
-            cand_seq = [item[1] for item in valid_moves]
+            valid_moves.sort(key=lambda item: (item[0], item[1], item[2]))
+            cand_seq = [item[2] for item in valid_moves]
+            if on_own_hill and fallback_off_hill:
+                fallback_off_hill.sort(key=lambda item: (item[0], item[1], item[2]))
+                cand_seq.extend(item[2] for item in fallback_off_hill)
             cand_seq.append(HOLD)
             candidate_sequences.append(cand_seq)
 
-        # 6. 终点冲突仲裁保底
-        active_stalls = stall_counters if stall_counters is not None else self.stall_counters
+        # 6. 终点冲突仲裁保底（未显式传入 stall_counters 时严格无状态，杜绝跨对局状态泄漏）
         out, updated_stalls = arbitrate_orders(
             mine_coords=mine,
             candidate_sequences=candidate_sequences,
             potentials=potentials,
-            stall_counters=active_stalls,
-            fair_mode=fair_mode,
+            stall_counters=stall_counters,
+            fair_mode=fair_mode if stall_counters is not None else False,
             rows=rows,
             cols=cols,
             ids=ant_ids,
-            squad_tiers=squad_tiers,
+            squad_tiers=effective_tiers if (squad_tiers is not None or has_own_hill_ant) else None,
             rejections_out=candidate_rejections_map,
         )
 
         if stall_counters is not None:
             stall_counters.clear()
             stall_counters.update(updated_stalls)
-        self.stall_counters.clear()
-        self.stall_counters.update(updated_stalls)
 
         # 7. 遥测数据采集
         telemetry_records: list[TelemetryRecord] = []

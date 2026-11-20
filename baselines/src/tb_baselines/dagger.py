@@ -1,20 +1,5 @@
-"""DAgger (Dataset Aggregation) Closed-Loop Controller.
-
-Implements the interactive imitation learning pipeline for TinyBrains Ants:
-1. InformationAlignmentGate: Strict security barrier ensuring the Teacher Oracle
-   evaluates decisions strictly under the student's physical observation (O_t)
-   and Where memory (M_t), with zero privileged information.
-2. StudentDriver: Drives physical environment rollouts using the student policy
-   network, supporting size-grouped batched inference, argmax move selection,
-   and memory advancement.
-3. StateTracker: Tracks per-ant policy disagreement rate P(pi_S != a_T) and
-   macro state space coverage.
-4. DatasetAggregator: Lossless, memory-bounded D_k = D_{k-1} U Delta D_k merge
-   with episode stride offsets and header verification.
-5. rollout_iteration: Single-iteration rollout loop generating standardized
-   training datasets.
-6. CLI entrypoint supporting multi-iteration DAgger pipeline execution.
-"""
+# DAgger (Dataset Aggregation) 交互式模仿学习闭环控制器。
+# 包含 InformationAlignmentGate、StudentDriver、混合对手驱动器、StateTracker、DatasetAggregator 及 rollout_iteration。
 
 from __future__ import annotations
 
@@ -28,16 +13,27 @@ import time
 from typing import Any
 
 import numpy as np
+import onnxruntime as ort
 import torch
 
 from . import nets
 from .env import Env, Step, orders_from_indices
 from .export import classes
 from .planes import MEMORY, encode, encode_memory, remember
-from .teacher import Teacher, known
+from .teacher import CompoundTeacher, TacticalLocalTeacher, Teacher, known
 
 STRIDE = 100_000
 EXPECTED_DIGEST = "sha256:819166e7918117a1cbbd67dc042e7368a076a2dd45cea5122683983912d591e1"
+
+
+def build_teacher_by_name(teacher: str = "default", hill_lead: int = 6):
+    if teacher == "default":
+        return Teacher(hill_lead=hill_lead)
+    if teacher == "compound":
+        return CompoundTeacher(hill_lead=hill_lead)
+    if teacher == "tactical":
+        return TacticalLocalTeacher(hill_lead=hill_lead)
+    raise ValueError(f"unknown teacher: {teacher!r}; expected 'default', 'compound' or 'tactical'")
 
 
 # ==============================================================================
@@ -139,6 +135,9 @@ class StudentDriver:
         weights_path: Path | str | None = None,
         spec: dict[str, Any] | None = None,
         device: str | torch.device | None = None,
+        cls: str | None = None,
+        channels: int | None = None,
+        blocks: int | None = None,
     ):
         if device is None:
             self.device = torch.device("cpu")
@@ -147,7 +146,18 @@ class StudentDriver:
         else:
             self.device = device
 
-        self.spec = spec if spec is not None else classes()["nano"]
+        if spec is not None:
+            resolved_spec = dict(spec)
+        else:
+            base_cls = cls if cls is not None else "nano"
+            resolved_spec = dict(classes()[base_cls])
+        if channels is not None:
+            resolved_spec["channels"] = int(channels)
+        if blocks is not None:
+            resolved_spec["blocks"] = int(blocks)
+        if resolved_spec.get("arch") in ("trunk", "percell"):
+            resolved_spec.pop("stride", None)
+        self.spec = resolved_spec
         self.model = nets.build(self.spec, memory="where").to(self.device)
 
         if weights_path is not None:
@@ -181,7 +191,7 @@ class StudentDriver:
 
             rr = torch.tensor([r for r, c in mine], dtype=torch.long, device=self.device)
             cc = torch.tensor([c for r, c in mine], dtype=torch.long, device=self.device)
-            ant_logits = logits[0, :, rr, cc].T  # [num_ants, 5]
+            ant_logits = logits[0][:, rr, cc].T  # [num_ants, 5]
             seat_moves = ant_logits.argmax(dim=-1).cpu().numpy()
             actions = [int(a) for a in seat_moves]
             order_str = orders_from_indices(seat_moves, [len(mine)])[0]
@@ -225,7 +235,7 @@ class StudentDriver:
 
                     rr = torch.tensor([r for r, c in mine], dtype=torch.long, device=self.device)
                     cc = torch.tensor([c for r, c in mine], dtype=torch.long, device=self.device)
-                    ant_logits = policy_logits[p, :, rr, cc].T  # [num_ants, 5]
+                    ant_logits = policy_logits[p][:, rr, cc].T  # [num_ants, 5]
                     seat_moves = ant_logits.argmax(dim=-1).cpu().numpy()
                     order = orders_from_indices(seat_moves, [len(mine)])[0]
 
@@ -233,6 +243,65 @@ class StudentDriver:
                     moves_by_seat[seat_idx] = seat_moves
 
         return actions, moves_by_seat
+
+
+class TeacherOpponentDriver:
+    def __init__(self, teacher: Any, name: str = "teacher_opponent", memory_mode: str = "where"):
+        self.teacher = teacher
+        self.name = name
+        self.memory_mode = memory_mode
+
+    def act(self, obs: dict[str, Any], memory: dict[str, Any] | None = None) -> tuple[str, list[int]]:
+        mine = obs.get("mine", [])
+        if not mine:
+            return "", []
+        water, seen = known(obs)
+        mv = self.teacher.orders(obs, water, seen, memory)
+        order_str = orders_from_indices(mv, [len(mine)])[0]
+        return order_str, [int(x) for x in mv]
+
+
+class ONNXOpponentDriver:
+    def __init__(self, model_dir: Path | str, name: str | None = None, memory_mode: str | None = None):
+        mdir = Path(model_dir)
+        onnx_path = mdir / "model.onnx" if mdir.is_dir() else mdir
+        if not onnx_path.exists():
+            raise FileNotFoundError(f"未找到对手 ONNX 模型文件: {onnx_path}")
+        self.name = name or (mdir.name if mdir.is_dir() else onnx_path.stem)
+        sess_opts = ort.SessionOptions()
+        sess_opts.intra_op_num_threads = 2
+        self.session = ort.InferenceSession(
+            str(onnx_path),
+            sess_options=sess_opts,
+            providers=["CPUExecutionProvider"],
+        )
+        input_names = [i.name for i in self.session.get_inputs()]
+        self.uses_memory = "memory_in" in input_names
+        if memory_mode is not None:
+            self.memory_mode = memory_mode
+        else:
+            metrics_file = onnx_path.parent / "metrics.json"
+            if metrics_file.exists():
+                m_doc = json.loads(metrics_file.read_text(encoding="utf-8"))
+                self.memory_mode = m_doc.get("memory_kind") or ("max" if "max" in self.name else "where")
+            else:
+                self.memory_mode = "max" if "max" in self.name else "where"
+
+    def act(self, obs: dict[str, Any], memory: dict[str, Any] | None = None) -> tuple[str, list[int]]:
+        mine = obs.get("mine", [])
+        if not mine:
+            return "", []
+        rows, cols = obs["size"]
+        feed: dict[str, np.ndarray] = {"board": encode(obs)}
+        if self.uses_memory:
+            feed["memory_in"] = encode_memory(memory, (rows, cols))
+        policy = self.session.run(["policy"], feed)[0]
+        rr = np.array([r for r, c in mine], dtype=np.int64)
+        cc = np.array([c for r, c in mine], dtype=np.int64)
+        ant_logits = policy[0][:, rr, cc].T
+        seat_moves = ant_logits.argmax(axis=-1)
+        order_str = orders_from_indices(seat_moves, [len(mine)])[0]
+        return order_str, [int(x) for x in seat_moves]
 
 
 # ==============================================================================
@@ -449,7 +518,7 @@ class DatasetAggregator:
         out_path.parent.mkdir(parents=True, exist_ok=True)
         rows_count = 0
 
-        with gzip.open(out_path, "wt") as w:
+        with gzip.open(out_path, "wt", compresslevel=1) as w:
             w.write(json.dumps(merged_header) + "\n")
             for i, part in enumerate(part_paths):
                 offset = i * self.stride
@@ -521,10 +590,12 @@ def rollout_iteration(
     maps: str | None = None,
     baseline_signatures: set[tuple] | None = None,
     prior_state_hashes: set[bytes] | None = None,
+    opponent_drivers: list[Any] | None = None,
+    teacher_type: str = "default",
 ) -> dict[str, Any]:
     """Execute a single DAgger rollout iteration.
 
-    Environment physically stepped by student_driver;
+    Environment physically stepped by student_driver (or mixed opponents on opponent seats);
     Labels generated by gate under student's (O_t, M_t);
     Streams records (o, m, k, a) tuples into out_path.
     """
@@ -541,6 +612,7 @@ def rollout_iteration(
     tracker = StateTracker(baseline_signatures=baseline_signatures)
     iteration_unique_states: set[bytes] = set()
     novel_states: set[bytes] = set()
+    use_mixed_opponents = bool(opponent_drivers)
 
     with Env(
         waves=waves,
@@ -556,8 +628,8 @@ def rollout_iteration(
             "maps": [m["id"] for m in env.hello["maps"]],
             "max_turns": max_turns,
             "env_seed": seed,
-            "teacher": f"deterministic potential field (hill_lead={gate.teacher.hill_lead}), remembering",
-            "teacher_type": "default",
+            "teacher": f"{teacher_type} (hill_lead={gate.teacher.hill_lead}), remembering",
+            "teacher_type": teacher_type,
             "teacher_remembers": True,
             "hill_lead": gate.teacher.hill_lead,
             "memory_mode": "where",
@@ -571,48 +643,61 @@ def rollout_iteration(
         step = env.reset()
 
         while written < seat_turns:
-            # 1. Compute student actions for all active seats
+            # 1. 批量计算学生网络在当前各席位的候选动作
             student_orders, student_moves = student_driver.predict_step(step, student_memory)
+            step_orders = list(student_orders)
 
-            # 2. For each seat, query Teacher via Gate on (O_t, M_t) and write training row
+            # 2. 对学生控制席位通过 Gate 标注并落盘；对混合对手控制席位使用对手驱动步进环境
             for seat_idx, s in enumerate(step.seats):
                 key = (s.ep, s.seat)
                 M_t = student_memory.get(key)
 
-                # Oracle labeling under strict local information alignment
-                teacher_moves, teacher_order = gate.label(s.obs, M_t)
+                if not use_mixed_opponents:
+                    is_student_seat = True
+                    opp_driver = None
+                else:
+                    if (s.ep + s.seat) % 2 == 0:
+                        is_student_seat = True
+                        opp_driver = None
+                    else:
+                        opp_driver = opponent_drivers[(s.ep + s.seat // 2) % len(opponent_drivers)]
+                        is_student_seat = opp_driver is student_driver
 
-                # Track metrics and write dataset rows
-                if s.obs["mine"]:
-                    n_ants = len(s.obs["mine"])
-                    s_moves = student_moves[seat_idx]
-                    if len(s_moves) == n_ants and len(teacher_moves) == n_ants:
-                        tracker.record_step(s.obs, M_t, s_moves, teacher_moves)
+                if is_student_seat:
+                    teacher_moves, teacher_order = gate.label(s.obs, M_t)
 
-                    # Spatial state hashing
-                    fp = hashlib.sha256(encode(s.obs).tobytes()).digest()[:8]
-                    iteration_unique_states.add(fp)
-                    if prior_state_hashes is not None and fp not in prior_state_hashes:
-                        novel_states.add(fp)
+                    if s.obs["mine"]:
+                        n_ants = len(s.obs["mine"])
+                        s_moves = student_moves[seat_idx]
+                        if len(s_moves) == n_ants and len(teacher_moves) == n_ants:
+                            tracker.record_step(s.obs, M_t, s_moves, teacher_moves)
 
-                    # Write row if quota remains
-                    if written < seat_turns:
-                        row = {
-                            "o": s.obs,
-                            "k": [s.ep + episode_offset, s.seat, s.turn],
-                            "m": M_t or {},
-                            "a": teacher_order,
-                        }
-                        f.write(json.dumps(row, separators=(",", ":")) + "\n")
-                        written += 1
+                        fp = hashlib.sha256(encode(s.obs).tobytes()).digest()[:8]
+                        iteration_unique_states.add(fp)
+                        if prior_state_hashes is not None and fp not in prior_state_hashes:
+                            novel_states.add(fp)
 
-                # 3. Synchronously advance student's Where memory along actual trajectory
-                student_memory[key] = remember(M_t, s.obs, mode="where")
+                        if written < seat_turns:
+                            row = {
+                                "o": s.obs,
+                                "k": [s.ep + episode_offset, s.seat, s.turn],
+                                "m": M_t or {},
+                                "a": teacher_order,
+                            }
+                            f.write(json.dumps(row, separators=(",", ":")) + "\n")
+                            written += 1
 
-            # 4. Physically step the environment using STUDENT'S actions
-            step = env.step(student_orders)
+                    student_memory[key] = remember(M_t, s.obs, mode="where")
+                else:
+                    opp_order, _ = opp_driver.act(s.obs, M_t)
+                    step_orders[seat_idx] = opp_order
+                    opp_mem_mode = getattr(opp_driver, "memory_mode", "where")
+                    student_memory[key] = remember(M_t, s.obs, mode=opp_mem_mode)
 
-            # 5. Clean up memory for ended matches
+            # 3. 物理步进环境
+            step = env.step(step_orders)
+
+            # 4. 清理已结束对局的记忆
             for e in step.ended:
                 episodes += 1
                 reasons[e.reason] = reasons.get(e.reason, 0) + 1
@@ -675,8 +760,16 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--max-turns", type=int, default=300)
     ap.add_argument("--maps", default=None,
                     help="棋盘 ID、文件路径或包含棋盘的目录；默认为发布包中的基础棋盘")
+    ap.add_argument("--teacher", choices=["default", "compound", "tactical"], default="default",
+                    help="标注教师策略类型：'default', 'compound' 或 'tactical'（默认 'default'）")
     ap.add_argument("--hill-lead", type=int, default=6,
                     help="教师模型起步领先步数（默认 6）")
+    ap.add_argument("--class", dest="cls", default="nano",
+                    help="学生网络规格等级（默认 'nano'）")
+    ap.add_argument("--channels", type=int, default=None,
+                    help="覆盖学生网络通道数")
+    ap.add_argument("--blocks", type=int, default=None,
+                    help="覆盖学生网络残差/空洞块数")
     ap.add_argument("--device", default=None,
                     help="推理设备（'cpu', 'cuda' 等）")
 
@@ -687,7 +780,8 @@ def main(argv: list[str] | None = None) -> None:
     out_data.parent.mkdir(parents=True, exist_ok=True)
     a.out_run.mkdir(parents=True, exist_ok=True)
 
-    gate = InformationAlignmentGate(hill_lead=a.hill_lead)
+    teacher_agent = build_teacher_by_name(a.teacher, hill_lead=a.hill_lead)
+    gate = InformationAlignmentGate(teacher=teacher_agent, hill_lead=a.hill_lead)
     aggregator = DatasetAggregator(stride=STRIDE)
 
     parts: list[Path] = [a.base_data]
@@ -706,7 +800,13 @@ def main(argv: list[str] | None = None) -> None:
         iter_seed = a.seed + k * 100
         delta_path = out_data.parent / f"{out_data.name.split('.')[0]}_iter{k}.jsonl.gz"
 
-        driver = StudentDriver(weights_path=current_weights, device=a.device)
+        driver = StudentDriver(
+            weights_path=current_weights,
+            device=a.device,
+            cls=a.cls,
+            channels=a.channels,
+            blocks=a.blocks,
+        )
         print(f"Executing rollout iteration {k} with seed {iter_seed} -> {delta_path}...")
 
         rollout_stats = rollout_iteration(
@@ -720,6 +820,7 @@ def main(argv: list[str] | None = None) -> None:
             max_turns=a.max_turns,
             seed=iter_seed,
             maps=a.maps,
+            teacher_type=a.teacher,
         )
         print(f"Iteration {k} rollout complete: {rollout_stats['rows']} rows, "
               f"Disagreement: {rollout_stats['disagreement_rate'] * 100:.2f}%, "

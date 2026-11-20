@@ -149,7 +149,7 @@ def test_multiseat_adaptive_raid_and_defense_reservation():
     # 己方 2 座基地蚁穴：(10, 10) 与 (10, 30)
     hills = [(10, 10, 0), (10, 30, 0), (40, 40, 1), (40, 10, 2)]
 
-    # 场景 1: 前期（回合 20），总兵力 10 只
+    # 场景 1: 前期（兵力 10 只 >= min_raid_ants=4），不应因多席位或地图尺寸被饥饿锁定为 0 突击
     mine_early = [(10, 11), (10, 12), (11, 10), (12, 10), (10, 29), (10, 31), (11, 30), (12, 30), (15, 20), (16, 20)]
     obs_early = make_test_obs(rows, cols, mine_early, food=[(20, 20)], hills=hills, turn=20, players=4)
 
@@ -157,9 +157,10 @@ def test_multiseat_adaptive_raid_and_defense_reservation():
     orders_early = teacher.orders(obs_early, water, seen)
     tasks_early = teacher.get_last_tasks()
 
-    # 前期兵力少且回合早，突击比例被限制在 10% 以下，突击兵力为 0，优先保障经济采食
     assault_count_early = sum(1 for t in tasks_early.values() if t == TaskState.ASSAULT)
-    assert assault_count_early == 0
+    assert assault_count_early >= 2
+    # 无敌蚁威胁时严禁产生产卵丘 FORTIFY 回退
+    assert sum(1 for t in tasks_early.values() if t == TaskState.FORTIFY) == 0
 
     # 场景 2: 敌方蚂蚁逼近基地 (10, 10)
     # 敌方蚂蚁在 (11, 11) 距离基地仅 2 格
@@ -169,7 +170,7 @@ def test_multiseat_adaptive_raid_and_defense_reservation():
     orders_threat = teacher.orders(obs_threat, water, seen)
     tasks_threat = teacher.get_last_tasks()
 
-    # 验证就近防守逻辑激活：基地附近兵力被赋予防守任务 FORTIFY
+    # 验证就近拦截防守逻辑激活：基地附近兵力被赋予 FORTIFY 拦截威胁敌蚁（不回退驻守己方蚁丘格）
     fortify_count = sum(1 for t in tasks_threat.values() if t == TaskState.FORTIFY)
     assert fortify_count >= 2
 
@@ -323,12 +324,12 @@ def test_basic_small_3p_multi_seat_early_raid_quota():
 
     tasks = teacher.get_last_tasks()
     assault_count = sum(1 for t in tasks.values() if t == TaskState.ASSAULT)
-    # 按照规定，多席位兵力小于 15 只时突击比例必须严格为 0%
-    assert assault_count == 0
+    # 消除失效 turn 键与 36x36 多席位突击饥饿：兵力 12 >= min_raid_ants=4 时应正常派出突击分队
+    assert assault_count >= 3
 
 
-def test_fully_explored_remaining_ants_fallback_to_fortify():
-    # 4 席位地图全探索无迷雾前沿时突击配额控制检验
+def test_fully_explored_remaining_ants_no_fortify_fallback():
+    # 4 席位地图全探索无迷雾前沿时，剩余兵力应推进敌丘而非回退 FORTIFY 堵塞产卵丘
     rows, cols = 48, 64
     water = np.zeros((rows, cols), dtype=bool)
     seen = np.ones((rows, cols), dtype=bool)
@@ -357,10 +358,9 @@ def test_fully_explored_remaining_ants_fallback_to_fortify():
     assault_count = sum(1 for t in tasks.values() if t == TaskState.ASSAULT)
     fortify_count = sum(1 for t in tasks.values() if t == TaskState.FORTIFY)
 
-    # 突击比例必须满足多席位早期至多 10% 配额约束（20 只兵力至多 2 只突击）
-    assert assault_count <= 2
-    # 未获配采食任务的剩余兵力回退为防守驻守基地，杜绝全部升级为突击
-    assert fortify_count >= 16
+    # 无近身敌蚁威胁时严禁触发 FORTIFY 回退，全部空闲兵力推进已知敌丘
+    assert fortify_count == 0
+    assert assault_count >= 16
 
 
 def test_cost_matrix_multibucket_boundary_at_max_depth():
