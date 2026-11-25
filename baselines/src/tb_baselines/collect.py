@@ -1,28 +1,5 @@
-"""运行教师模型并记录其行为：供所有监督学习网络训练的数据集生成器。
-
-    python -m tb_baselines.collect --seat-turns 200000 --out data/teacher.jsonl.gz
-
-**单个数据集，供所有学习器复用。** 这是使方法列具备对比价值的核心前提：
-逐单元格线性模型、卷积主干网络以及任何其他网络都在相同的数据和相同的标签上训练，
-仅仅在学习算法上有所差异 —— 这正是天梯设立的初衷。如果每次重新生成数据，对比将同时混入两个变量。
-
-## 单行数据的结构
-
-记录单个座位在单个回合的对局状态：游戏引擎发出的原始观测数据；按 `mine` 顺序每只蚂蚁对应一个字符的行动指令（与回放增量 delta 记录格式完全相同）；
-在 `m` 键下记录该座位进入该回合时所记住的状态（`planes.MEMORY`：曾经出现过食物和敌方蚁穴的单元格列表，格式为排序后的 `[r, c]` 坐标列表）；
-以及在 `k` 键下记录该行在整场比赛中的位置，格式为 `[episode, seat, turn]`。
-
-存储观测数据而非张量有两个关键原因：张量体积是前者的 50 倍 —— 7x128x128 的 int8 棋盘张量约为 114 KiB，
-而对应的 JSON 仅约 2 KiB —— 因此 20 万行数据如果存张量需要 23 GiB，而存观测数据仅需 400 MiB。
-此外，将张量固化到数据集中意味着特征编码在采集时就被冻结：`planes.py` 应当能够自由增加特征平面，而无需让既有数据集全部失效。
-记住的状态是唯一的例外，因为它是当前行之前各回合的累积函数，而各数据行在其他方面是相互独立的：
-修改 `MEMORY` 必须生成全新的数据集，且文件头中声明了这些特征平面的名称，以便 `train/bc.py` 能够拒绝过时的旧数据集。
-
-## 本模块不是什么
-
-它不是对局录像，无法直接可视化播放。录像由 `tinybrains <match>` 生成；这里是纯粹的观测数据集合，满足监督学习器的需求。
-`k` 字段是贯穿其中的唯一时序线索：计算图自主计算记忆的学习器（`train/seq.py`）会按时序读取座位的连续数据行，而其他学习器则直接随机打乱。
-"""
+# 运行教师模型并记录其行为：供所有监督学习网络训练的数据集生成器。
+# 单个数据集供所有学习器复用，在每行记录原始观测 o、位置 k=[ep, seat, turn]、记忆 m 及教师动作 a。
 
 from __future__ import annotations
 
@@ -36,7 +13,7 @@ from pathlib import Path
 
 from .env import Env, orders_from_indices
 from .planes import MEMORY, remember
-from .teacher import CompoundTeacher, Teacher
+from .teacher import CompoundTeacher, TacticalLocalTeacher, Teacher
 
 
 def collect(
@@ -63,8 +40,11 @@ def collect(
     elif teacher == "compound":
         teacher_agent = CompoundTeacher(hill_lead=hill_lead)
         teacher_desc = "compound situational policy"
+    elif teacher == "tactical":
+        teacher_agent = TacticalLocalTeacher(hill_lead=hill_lead)
+        teacher_desc = f"local tactical focus-battle potential field (hill_lead={hill_lead})"
     else:
-        raise ValueError(f"unknown teacher: {teacher!r}; expected 'default' or 'compound'")
+        raise ValueError(f"unknown teacher: {teacher!r}; expected 'default', 'compound' or 'tactical'")
     out.parent.mkdir(parents=True, exist_ok=True)
 
     written = 0
@@ -164,8 +144,8 @@ def main(argv: list[str] | None = None) -> None:
                     help="棋盘 ID、文件路径或包含棋盘的目录；默认为发布包中的基础棋盘")
     ap.add_argument("--remember", action="store_true",
                     help="教师模型读取每个座位的记忆，生成的训练标签将依赖于记忆状态")
-    ap.add_argument("--teacher", choices=["default", "compound"], default="default",
-                    help="教师模型策略类型：'default' 为势能场单一教师，'compound' 为条件化复合调度教师（默认 'default'）")
+    ap.add_argument("--teacher", choices=["default", "compound", "tactical"], default="default",
+                    help="教师模型策略类型：'default' 为势能场单一教师，'compound' 为复合调度教师，'tactical' 为局部聚焦战势能场教师（默认 'default'）")
     ap.add_argument("--hill-lead", type=int, default=6,
                     help="敌方蚁丘相对食物的起步领先步数（默认 6，激进进攻设为 12）")
     ap.add_argument("--memory-mode", choices=["where", "max"], default="where",

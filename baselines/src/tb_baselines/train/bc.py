@@ -1,50 +1,11 @@
-"""行为克隆（Behaviour Cloning）：将指定规格等级的网络拟合到教师策略的动作上。
-
-    python -m tb_baselines.train.bc --class micro --data data/teacher.jsonl.gz --epochs 6
-
-这就是**规格天梯（class ladder）**：将单一固定教师蒸馏到五个字节预算等级中，
-从而让竞赛真正提出的问题 —— 在 N 字节内能容纳多少博弈智能 —— 得到可衡量的答案，而非主观争论。
-它也是整个矩阵中可靠的一半。在 Ants 上进行自对弈强化学习（Self-play RL）面临奖励稀疏、长时序范围、
-多智能体协同以及战争迷雾等挑战；而模仿学习则不受这些问题困扰，且天梯在需要有趣的对手之前，首先需要能跑起来的对手。
-
-## 损失函数是针对单只蚂蚁（per ant）计算，而非整个棋盘
-
-网络输出一个稠密的 `[batch, 5, rows, cols]` 策略图，但只有当前座位蚂蚁所在的单元格具有实际意义。
-因此，损失函数仅采集这些有蚁单元格，并与教师在对应位置的动作计算交叉熵。
-其余所有位置均不受约束，这是刻意为之的设计：一个棋盘有 16,384 个单元格，其中大约只有 30 个有蚂蚁，
-如果让空格子也向任何目标训练，会将真实信号淹没在 500:1 的噪声之中。
-
-在阅读损失曲线前值得注意的一个推论：**一个批次（batch）包含的决策样本数量是变化的**，
-因为不同对局和座位上的存活蚂蚁数量不同。报告的损失是按每只蚂蚁平均计算的。
-
-## 实测标签分布特征
-
-在 116 万次决策样本中，教师的动作分布为：**西(W) 25.6% / 东(E) 25.3% / 南(S) 24.3% / 北(N) 23.8% / 原地待命(-) 1.0%**。
-无需做类别不平衡矫正：蚂蚁几乎总有目的地要奔赴，且四个方向的分布接近均匀。
-
-这种接近均匀的分布，也是第一个数据集被废弃的原因。当时教师在决策前会对方向进行随机打乱，
-导致在开阔地形这一常见场景中，两个等距邻居成了掷硬币二选一，四分之一的标签根本不是状态的确定性函数。
-对抛硬币计算交叉熵存在任何模型容量都无法突破的下限，因此规格天梯测量的将是教师引入的随机噪声，
-而非各规格自身的表达容量。如今教师已是确定性的；详见 `teacher.py`。
-
-准确率是被最小化的优化量，但不是衡量对局实力的最终指标。网络可能在五分之四的情况下与教师一致，
-但对战表现却差得多，因为剩下的五分之一错误会在 300 回合中呈复利式累积放大。请务必实战检验。
-
-## `--memory` 参数
-
-启用 `--memory` 时，网络结构为 `nets.WithMemory`：它在读取棋盘特征的同时读取座位的记忆面（`planes.MEMORY`，
-通过 `Where` 条件更新算子保留的两个特征面：视野可见单元格更新为当前观测值清除幽灵敌丘，迷雾区域保留历史记忆），
-并将更新后的记忆写回。在 micro 等级（`--class micro --memory`）下，模型具有 28 通道、3 块空洞卷积（膨胀率 [1, 2, 4, 8]，
-单向感知距离 15 格，感受野 31x31）、9 个输入平面（7 板面 + 2 记忆面）以及严格 24,505 个物理参数（无记忆时为 24,001 个）。
-记忆是当前行之前各回合的确定性函数，因此训练循环保持不变：`collect.py` 在每行数据的 `m` 键下记录座位当时记住的内容，
-`tensors` 通过 `planes.encode_memory` 将其渲染为张量。
-由于教师已在生成轨迹时读取并维护记忆（`teacher_remembers: true`），模型能够端到端学习依赖记忆的战术决策；
-此训练运行验证的是带记忆模型贯穿准入校验、时序承接与 `conform` 一致性测试的整套链路。
-"""
+# 行为克隆（Behaviour Cloning）：将指定规格等级的网络拟合到教师策略动作上。
+# 损失函数针对单只蚂蚁计算交叉熵，支持 Where 记忆平面、多线程预取与 CUDA bfloat16 混合精度加速。
 
 from __future__ import annotations
 
 import argparse
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 import gzip
 import json
 import random
@@ -129,15 +90,14 @@ def batches(rows: Rows, indices: list[int], size: int, rng: random.Random, shuff
     return chunks
 
 
-def tensors(rows: Rows, batch: list[int], dev: torch.device, memory: bool = False):
-    """将一个批次转换为 `(boards, memory, sample, row, col, label)`，在其中所有蚂蚁上展开展平。
-    除非显式要求，否则 `memory` 为 None：各行对应座位记录的记忆状态，作为计算图的 `memory_in`。"""
+def _prepare_cpu_batch(rows: Rows, batch: list[int], memory: bool = False):
     parsed = [rows.parse(i) for i in batch]
     boards = np.concatenate([encode(r["o"]) for r in parsed], axis=0)
-    mem = None
-    if memory:
-        mem = torch.from_numpy(np.concatenate(
-            [encode_memory(r.get("m"), r["o"]["size"]) for r in parsed], axis=0)).to(dev)
+    mem_np = (
+        np.concatenate([encode_memory(r.get("m"), r["o"]["size"]) for r in parsed], axis=0)
+        if memory
+        else None
+    )
     b_idx, rr, cc, yy = [], [], [], []
     for i, r in enumerate(parsed):
         for (row, col), ch in zip(r["o"]["mine"], r["a"]):
@@ -146,12 +106,26 @@ def tensors(rows: Rows, batch: list[int], dev: torch.device, memory: bool = Fals
             cc.append(col)
             yy.append(MOVE_INDEX.get(ch, MOVE_INDEX["-"]))
     return (
-        torch.from_numpy(boards).to(dev),
-        mem,
-        torch.tensor(b_idx, dtype=torch.long, device=dev),
-        torch.tensor(rr, dtype=torch.long, device=dev),
-        torch.tensor(cc, dtype=torch.long, device=dev),
-        torch.tensor(yy, dtype=torch.long, device=dev),
+        torch.from_numpy(boards),
+        torch.from_numpy(mem_np) if mem_np is not None else None,
+        torch.tensor(b_idx, dtype=torch.long),
+        torch.tensor(rr, dtype=torch.long),
+        torch.tensor(cc, dtype=torch.long),
+        torch.tensor(yy, dtype=torch.long),
+    )
+
+
+def tensors(rows: Rows, batch: list[int], dev: torch.device, memory: bool = False):
+    """将一个批次转换为 `(boards, memory, sample, row, col, label)`，在其中所有蚂蚁上展开展平。
+    除非显式要求，否则 `memory` 为 None：各行对应座位记录的记忆状态，作为计算图的 `memory_in`。"""
+    boards_t, mem_t, b_t, r_t, c_t, y_t = _prepare_cpu_batch(rows, batch, memory)
+    return (
+        boards_t.to(dev),
+        mem_t.to(dev) if mem_t is not None else None,
+        b_t.to(dev),
+        r_t.to(dev),
+        c_t.to(dev),
+        y_t.to(dev),
     )
 
 
@@ -164,19 +138,46 @@ def ant_logits(policy: torch.Tensor, b, r, c) -> torch.Tensor:
     return policy[b, :, r, c]
 
 
+def _prefetched_batches(rows: Rows, chunks: list[list[int]], memory: bool, workers: int = 4, prefetch: int = 8):
+    if not chunks:
+        return
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        q = deque()
+        it = iter(chunks)
+        for _ in range(min(prefetch, len(chunks))):
+            b = next(it, None)
+            if b is not None:
+                q.append(pool.submit(_prepare_cpu_batch, rows, b, memory))
+        while q:
+            fut = q.popleft()
+            nxt = next(it, None)
+            if nxt is not None:
+                q.append(pool.submit(_prepare_cpu_batch, rows, nxt, memory))
+            yield fut.result()
+
+
 def run_epoch(model, rows, chunks, dev, opt=None, memory: bool = False) -> tuple[float, float, int]:
     train = opt is not None
     model.train(train)
-    total_loss = correct = seen = 0
-    for batch in chunks:
-        boards, mem, b, r, c, y = tensors(rows, batch, dev, memory)
-        if y.numel() == 0:
+    total_loss_t = torch.zeros((), device=dev, dtype=torch.float64)
+    correct_t = torch.zeros((), device=dev, dtype=torch.int64)
+    seen = 0
+    use_amp = dev.type == "cuda" and torch.cuda.is_bf16_supported()
+    for boards_cpu, mem_cpu, b_cpu, r_cpu, c_cpu, y_cpu in _prefetched_batches(rows, chunks, memory):
+        if y_cpu.numel() == 0:
             continue
+        boards = boards_cpu.to(dev, non_blocking=True)
+        mem = mem_cpu.to(dev, non_blocking=True) if mem_cpu is not None else None
+        b = b_cpu.to(dev, non_blocking=True)
+        r = r_cpu.to(dev, non_blocking=True)
+        c = c_cpu.to(dev, non_blocking=True)
+        y = y_cpu.to(dev, non_blocking=True)
         with torch.set_grad_enabled(train):
-            # 带记忆模型返回 (policy, memory)；记忆是确定性函数，不参与梯度反传。
-            policy = model(boards, mem)[0] if memory else model(boards)
-            logits = ant_logits(policy, b, r, c)
-            loss = F.cross_entropy(logits, y)
+            with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+                # 带记忆模型返回 (policy, memory)；记忆是确定性函数，不参与梯度反传。
+                policy = model(boards, mem)[0] if memory else model(boards)
+                logits = ant_logits(policy, b, r, c).float()
+                loss = F.cross_entropy(logits, y)
             if train:
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
@@ -184,10 +185,12 @@ def run_epoch(model, rows, chunks, dev, opt=None, memory: bool = False) -> tuple
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 opt.step()
         n = y.numel()
-        total_loss += loss.detach().item() * n
-        correct += int((logits.argmax(1) == y).sum())
+        total_loss_t += loss.detach().double() * n
+        correct_t += (logits.argmax(1) == y).sum()
         seen += n
-    return total_loss / max(seen, 1), correct / max(seen, 1), seen
+    if seen == 0:
+        return 0.0, 0.0, 0
+    return float(total_loss_t.item()) / seen, int(correct_t.item()) / seen, seen
 
 
 def override(spec: dict, args) -> dict:
@@ -204,7 +207,7 @@ def override(spec: dict, args) -> dict:
 
 
 def main(argv: list[str] | None = None) -> None:
-    ap = argparse.ArgumentParser(description=__doc__)
+    ap = argparse.ArgumentParser(description="将指定规格等级的网络拟合到教师策略动作的行为克隆训练器。")
     ap.add_argument("--class", dest="cls", required=True,
                     help="规格等级名称，如 nano, micro 等（见 classes.toml）")
     # 变体是命令行参数，而非第二张静态表：运行的 history.json 与模型卡片都会记录实际构建的内容，这才是关键记录。
@@ -220,6 +223,7 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--holdout", type=float, default=0.05)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", type=Path, default=None)
+    ap.add_argument("--init-weights", type=Path, default=None, help="可选初始检查点权重路径，用于 DAgger 迭代间热启动")
     argv = sys.argv[1:] if argv is None else argv
     a = ap.parse_args(argv)
 
@@ -252,6 +256,11 @@ def main(argv: list[str] | None = None) -> None:
 
     spec = override(classes()[a.cls], a)
     model = nets.build(spec, memory=a.memory).to(dev)
+    if a.init_weights is not None:
+        if not a.init_weights.exists():
+            raise FileNotFoundError(f"指定的初始检查点权重文件不存在: {a.init_weights}")
+        ckpt = torch.load(a.init_weights, map_location=dev, weights_only=True)
+        model.load_state_dict(ckpt["trunk"])
     b = budget(a.cls)
     print(f"{a.cls}: {nets.policy_params(model):,} parameters "
         f"(budget about {b['params_at_target']:,}), {dev.type}")
